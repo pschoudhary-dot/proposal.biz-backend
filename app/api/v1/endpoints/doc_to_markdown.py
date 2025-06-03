@@ -2,7 +2,7 @@
 API endpoints for document to markdown conversion using Docling.
 """
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Path, UploadFile, File, Form, Depends
-from typing import List, Optional
+from typing import List, Optional, Dict
 from uuid import UUID
 import uuid
 import tempfile

@@ -261,7 +261,6 @@ async def update_extraction_job_color_palette(job_id: str, image_source: str, co
     except Exception as e:
         logger.error(f"Error saving color palette for job_id {job_id}: {str(e)}")
 
-
 # Markdown extraction database functions
 async def create_markdown_extraction_job(job_id: str, urls: List[str], org_id: str, user_id: Optional[str] = None):
     """
@@ -514,7 +513,6 @@ async def get_markdown_content(job_id: str, org_id: Optional[str] = None):
     except Exception as e:
         logger.error(f"Error getting markdown content for job {job_id}: {str(e)}")
         return None
-
 
 # Document to Markdown conversion database functions
 async def create_document_conversion_job(job_id: str, org_id: str, user_id: Optional[str] = None):
@@ -828,7 +826,6 @@ async def get_document_content(job_id: str, org_id: Optional[str] = None):
         logger.error(f"Error getting document content for job {job_id}: {str(e)}")
         return None
 
-
 async def create_document_record(job_id: str, filename: str, org_id: str, user_id: str, 
                                document_type: str = "uploaded_file") -> Optional[str]:
     """
@@ -866,7 +863,6 @@ async def create_document_record(job_id: str, filename: str, org_id: str, user_i
     except Exception as e:
         logger.error(f"Error creating document record: {str(e)}")
         return None
-
 
 async def create_org_content_source_record(job_id: str, filename: str, org_id: str, 
                                          user_id: str, document_id: Optional[str] = None) -> Optional[str]:
@@ -913,7 +909,6 @@ async def create_org_content_source_record(job_id: str, filename: str, org_id: s
         logger.error(f"Error creating content source record: {str(e)}")
         return None
 
-
 async def update_document_status(document_id: str, status: str, content: dict = None):
     """
     Update document status and content.
@@ -940,7 +935,6 @@ async def update_document_status(document_id: str, status: str, content: dict = 
     except Exception as e:
         logger.error(f"Error updating document {document_id} status: {str(e)}")
         return None
-
 
 async def update_content_source_with_chunks(content_source_id: str, chunk_ids: List[str]) -> Optional[dict]:
     """
@@ -971,7 +965,6 @@ async def update_content_source_with_chunks(content_source_id: str, chunk_ids: L
     except Exception as e:
         logger.error(f"Error updating content source with chunks: {str(e)}")
         return None
-
 
 # Organization management functions
 async def create_organization(name: str, user_id: str, settings=None, logo=None, website=None, domain=None, plan_id=None):
@@ -1051,4 +1044,32 @@ async def get_organization(org_id: str, user_id: Optional[str] = None):
         return None
     except Exception as e:
         logger.error(f"Error getting organization {org_id}: {str(e)}")
+        return None
+
+async def update_document_content_task_id(job_id: str, filename: str, task_id: str, org_id: Optional[str] = None):
+    """
+    Update the Docling task ID for a document.
+    
+    Args:
+        job_id: Job ID
+        filename: Filename
+        task_id: Docling server task ID
+        org_id: Organization ID
+    """
+    try:
+        update_data = {
+            "docling_task_id": task_id,
+            "updated_at": dt.now().isoformat()
+        }
+        
+        query = supabase.table(DOCUMENT_CONTENT_TABLE).update(update_data).eq("job_id", job_id).eq("filename", filename)
+        
+        if org_id:
+            query = query.eq("org_id", org_id)
+            
+        response = query.execute()
+        logger.info(f"Updated Docling task_id for file {filename} in job {job_id}")
+        return response.data[0] if response.data else None
+    except Exception as e:
+        logger.error(f"Error updating document task_id: {str(e)}")
         return None
