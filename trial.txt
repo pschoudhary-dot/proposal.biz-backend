@@ -1,0 +1,20 @@
+test data :
+
+org: 491ecb59-02bb-4c0e-85ae-db32f5f3f579
+usr: e40fc540-244c-4c31-9f4f-b23392ad1a86
+
+
+ Verifying data insertion...
+   ✅ Found 6 organizations in the database
+
+   📋 Sample organization data:
+      1. Harvey, Richardson and Martinez (ID: 264b8635-c6a0-45a9-92c2-3ad47eb661a2)
+      2. Harper, Rivera and Walters (ID: ab4119ca-5cc0-438e-9cf8-7fd52f0d8ac6)
+   ✅ Found 4 organization-user relationships in the database
+
+   📋 Sample org-user data:
+      1. User ID: e40fc540-244c-4c31-9f4f-b23392ad1a86 - Role: admin in Org: 491ecb59-02bb-4c0e-85ae-db32f5f3f579
+      2. User ID: 5c6cfb67-b938-4852-abd2-19d1195b0a66 - Role: member in Org: 491ecb59-02bb-4c0e-85ae-db32f5f3f579
+
+🏁 Test completed!
+
