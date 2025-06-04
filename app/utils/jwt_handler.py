@@ -43,6 +43,8 @@ async def verify_jwt_cookie_middleware(request: Request, call_next):
         "/docs",
         "/redoc",
         "/openapi.json",
+        "/api/v1/openapi.json",  # Add the actual OpenAPI endpoint
+        "/",  # Root endpoint
     ]
     
     # Skip authentication for public endpoints

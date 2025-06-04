@@ -19,7 +19,7 @@ from app.schemas.markdown_extraction import (
     MarkdownResultResponse,
     MarkdownContent
 )
-from app.utils.markdown_extraction import start_batch_scrape
+from app.utils.url_markdown_extraction import start_batch_scrape
 from app.api.deps import get_current_user_id
 
 router = APIRouter()

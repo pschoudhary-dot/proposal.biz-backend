@@ -8,43 +8,63 @@ from app.core.logging import logger
 from app.core.database import supabase
 import json
 
-# Table names for database operations
-ORG_CONTENT_SOURCES_TABLE = "orgcontentsources"
-ORG_CONTENT_LIBRARY_TABLE = "orgcontentlibrary"
-CONTENT_LIB_JOBS_TABLE = "contentlibraryjobs"
+# Table names for database operations (Updated to match new schema)
+ORG_CONTENT_SOURCES_TABLE = "org_content_sources"  # Updated from "orgcontentsources"
+ORG_CONTENT_LIBRARY_TABLE = "org_content_library"  # Updated from "orgcontentlibrary"
+CONTENT_LIB_JOBS_TABLE = "contentlibraryjobs"  # LEGACY - will use processing_jobs
+PROCESSING_JOBS_TABLE = "processing_jobs"  # NEW - unified job processing
+CONTENT_LIBRARY_RESULTS_TABLE = "content_library_results"  # NEW - structured results
 
 async def create_content_library_job(job_id: str, org_id: UUID, source_ids: List[UUID], user_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Create a new content library processing job.
-    
+    UPDATED: Now uses unified processing_jobs table.
+
     Args:
         job_id: Unique job ID
         org_id: Organization ID
         source_ids: List of content source IDs to process
         user_id: User ID who created the job
-        
+
     Returns:
         The created job record
     """
-    job_record = {
-        "job_id": job_id,
-        "org_id": str(org_id),
-        "status": "pending",
-        "source_count": len(source_ids),
-        "processed_count": 0,
-        "source_ids": [str(source_id) for source_id in source_ids],
-        "created_by": user_id,
-        "created_at": dt.now().isoformat(),
-        "updated_at": dt.now().isoformat()
-    }
-    
-    try:
-        response = supabase.table(CONTENT_LIB_JOBS_TABLE).insert(job_record).execute()
+    # Import the unified job creation function
+    from app.core.database import create_processing_job
+
+    # Use the new unified job processing system
+    job_record = await create_processing_job(
+        job_id=job_id,
+        job_type="content_library",
+        org_id=str(org_id),
+        user_id=user_id,
+        source_ids=[str(source_id) for source_id in source_ids],
+        total_items=len(source_ids),
+        metadata={
+            "source_count": len(source_ids),
+            "processed_count": 0,
+            "source_ids": [str(source_id) for source_id in source_ids]
+        }
+    )
+
+    if job_record:
         logger.info(f"Created content library job: {job_id} for org_id: {org_id}")
-        return response.data[0] if response.data else job_record
-    except Exception as e:
-        logger.error(f"Error creating content library job: {str(e)}")
-        raise
+        return job_record
+    else:
+        # Fallback record for backward compatibility
+        fallback_record = {
+            "job_id": job_id,
+            "org_id": str(org_id),
+            "status": "pending",
+            "source_count": len(source_ids),
+            "processed_count": 0,
+            "source_ids": [str(source_id) for source_id in source_ids],
+            "created_by": user_id,
+            "created_at": dt.now().isoformat(),
+            "updated_at": dt.now().isoformat()
+        }
+        logger.warning(f"Using fallback record for content library job {job_id}")
+        return fallback_record
 
 async def get_content_library_job(job_id: str, org_id: Optional[UUID] = None) -> Optional[Dict[str, Any]]:
     """

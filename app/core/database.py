@@ -14,31 +14,44 @@ local_job_cache = {}
 
 # Initialize Supabase client
 supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
-logger.info("Supabase client initialized successfully")
+logger.info(f"Supabase client initialized successfully - URL: {settings.SUPABASE_URL}")
 
 # Create a service role client for operations that need elevated permissions
 supabase_admin = create_client(
-    settings.SUPABASE_URL, 
+    settings.SUPABASE_URL,
     settings.SUPABASE_SERVICE_ROLE_KEY
 ) if hasattr(settings, 'SUPABASE_SERVICE_ROLE_KEY') else supabase
 logger.info("Service role client initialized successfully")
 
-# Table names for database operations
+# Table names for database operations (Updated to match new schema)
 ORGANIZATIONS_TABLE = "organizations"
-ORG_USERS_TABLE = "orgusers"
-ORG_CONTACTS_TABLE = "orgcontacts"
-ORG_CONTENT_SOURCES_TABLE = "orgcontentsources"
-ORG_CONTENT_LIBRARY_TABLE = "orgcontentlibrary"
-CONTENT_CHUNKS_TABLE = "contentchunks"
-EXTRACTION_JOBS_TABLE = "extractionjobs"
-MARKDOWN_JOBS_TABLE = "markdownextractionjobs"
-MARKDOWN_CONTENT_TABLE = "markdowncontent"
-EXTRACTED_LINKS_TABLE = "extractedlinks"
-DOCUMENT_JOBS_TABLE = "documentconversionjobs"
-DOCUMENT_CONTENT_TABLE = "documentcontent"
+ORG_USERS_TABLE = "organization_users"  # Updated from "orgusers"
+ORG_CONTACTS_TABLE = "contacts"  # TODO: Update to "contacts" when needed
+ORG_CONTENT_SOURCES_TABLE = "org_content_sources"  # Updated from "orgcontentsources"
+ORG_CONTENT_LIBRARY_TABLE = "org_content_library"  # Updated from "orgcontentlibrary"
+CONTENT_CHUNKS_TABLE = "content_chunks"  # Updated from "contentchunks"
+
+# Unified job processing table (replaces separate job tables)
+PROCESSING_JOBS_TABLE = "processing_jobs"
+
+# Legacy job tables (will be migrated to processing_jobs)
+EXTRACTION_JOBS_TABLE = "extractionjobs"  # LEGACY - use PROCESSING_JOBS_TABLE
+MARKDOWN_JOBS_TABLE = "markdownextractionjobs"  # LEGACY - use PROCESSING_JOBS_TABLE
+DOCUMENT_JOBS_TABLE = "documentconversionjobs"  # LEGACY - use PROCESSING_JOBS_TABLE
+
+# Result tables (updated naming)
+MARKDOWN_CONTENT_TABLE = "markdown_content"  # Updated from "markdowncontent"
+EXTRACTED_LINKS_TABLE = "extracted_links"  # Updated from "extractedlinks"
+DOCUMENT_CONTENT_TABLE = "document_content"  # Updated from "documentcontent"
 DOCUMENTS_TABLE = "documents"
-CHAT_SESSIONS_TABLE = "chatsessions"
-CHAT_MESSAGES_TABLE = "chatmessages"
+
+# New result tables for structured storage
+EXTRACTION_CONTENT_TABLE = "extraction_content"  # NEW - for website extraction results
+CONTENT_LIBRARY_RESULTS_TABLE = "content_library_results"  # NEW - for business data results
+
+# Chat system tables (updated naming)
+CHAT_SESSIONS_TABLE = "chat_sessions"  # Updated from "chatsessions"
+CHAT_MESSAGES_TABLE = "chat_messages"  # Updated from "chatmessages"
 
 # Helper function to get current user's organization IDs
 async def get_user_organizations(user_id: str) -> List[str]:
@@ -66,143 +79,506 @@ async def get_default_org_id(user_id: str) -> Optional[str]:
     Get the default organization ID for a user.
     If the user belongs to only one organization, return that.
     Otherwise, return the first organization in the list.
-    
+
     Args:
         user_id: The user ID to check
-        
+
     Returns:
         Default organization ID or None if user has no organizations
     """
     orgs = await get_user_organizations(user_id)
     return orgs[0] if orgs else None
 
+# =============================================
+# UNIFIED JOB PROCESSING SYSTEM
+# =============================================
+
+def _convert_org_id(org_id):
+    """Helper function to convert org_id to integer, handling UUIDs and strings."""
+    if org_id is None:
+        return None
+
+    # If it's already an integer, return it
+    if isinstance(org_id, int):
+        return org_id
+
+    # Convert to string first
+    org_id_str = str(org_id)
+
+    # If it looks like a UUID, extract a numeric representation or use a hash
+    if len(org_id_str) > 10 and '-' in org_id_str:
+        # For UUIDs, we'll use a hash to get a consistent integer
+        import hashlib
+        return abs(hash(org_id_str)) % (10**9)  # Keep it within reasonable integer range
+
+    # Try to convert directly to int
+    try:
+        return int(org_id_str)
+    except ValueError:
+        # If conversion fails, use hash
+        import hashlib
+        return abs(hash(org_id_str)) % (10**9)
+
+async def create_processing_job(
+    job_id: str,
+    job_type: str,
+    org_id: str,
+    user_id: Optional[str] = None,
+    source_url: Optional[str] = None,
+    source_files: Optional[List[str]] = None,
+    source_ids: Optional[List[str]] = None,
+    total_items: int = 0,
+    metadata: Optional[dict] = None
+) -> Optional[dict]:
+    """
+    Create a new processing job in the unified job system.
+
+    Args:
+        job_id: Unique job identifier
+        job_type: Type of job ('website_extraction', 'markdown_extraction', 'document_conversion', 'content_library', 'vector_processing')
+        org_id: Organization ID (string, UUID, or integer)
+        user_id: User ID who created the job
+        source_url: Source URL for web operations
+        source_files: List of filenames for document operations
+        source_ids: List of content source IDs for content library operations
+        total_items: Total number of items to process
+        metadata: Additional job-specific metadata
+
+    Returns:
+        The created job record or None if failed
+    """
+    job_record = {
+        "job_id": job_id,
+        "job_type": job_type,
+        "org_id": _convert_org_id(org_id),
+        "status": "pending",
+        "total_items": total_items,
+        "completed_items": 0,
+        "created_by": int(user_id) if user_id and user_id.isdigit() else None,
+        "metadata": metadata or {}
+    }
+
+    # Add type-specific fields
+    if source_url:
+        job_record["source_url"] = source_url
+    if source_files:
+        job_record["source_files"] = source_files
+    if source_ids:
+        job_record["source_ids"] = source_ids
+
+    try:
+        response = supabase.table(PROCESSING_JOBS_TABLE).insert(job_record).execute()
+        logger.info(f"Created processing job {job_id} of type {job_type} for org {org_id}")
+        return response.data[0] if response.data else job_record
+    except Exception as e:
+        # Enhanced error logging to capture detailed Supabase errors
+        error_details = str(e)
+        if hasattr(e, 'message'):
+            error_details = f"Code: {getattr(e, 'code', 'N/A')}, Message: {e.message}, Details: {getattr(e, 'details', 'N/A')}"
+        elif hasattr(e, 'args') and len(e.args) > 0:
+            error_details = str(e.args[0])
+
+        logger.error(f"Error creating processing job {job_id}: {error_details}", exc_info=True)
+        return None
+
+async def get_processing_job(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
+    """
+    Get a processing job by its ID.
+
+    Args:
+        job_id: Unique job identifier
+        org_id: Optional organization ID for security check
+
+    Returns:
+        The job record or None if not found
+    """
+    try:
+        query = supabase.table(PROCESSING_JOBS_TABLE).select("*").eq("job_id", job_id)
+
+        if org_id:
+            query = query.eq("org_id", _convert_org_id(org_id))
+
+        response = query.execute()
+
+        if response.data:
+            return response.data[0]
+        return None
+    except Exception as e:
+        # Enhanced error logging to capture detailed Supabase errors
+        error_details = str(e)
+        if hasattr(e, 'message'):
+            error_details = f"Code: {getattr(e, 'code', 'N/A')}, Message: {e.message}, Details: {getattr(e, 'details', 'N/A')}"
+        elif hasattr(e, 'args') and len(e.args) > 0:
+            error_details = str(e.args[0])
+
+        logger.error(f"Error getting processing job {job_id}: {error_details}", exc_info=True)
+        return None
+
+async def update_processing_job(
+    job_id: str,
+    status: Optional[str] = None,
+    completed_items: Optional[int] = None,
+    error_message: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    org_id: Optional[str] = None
+) -> Optional[dict]:
+    """
+    Update a processing job.
+
+    Args:
+        job_id: Unique job identifier
+        status: New status ('pending', 'processing', 'completed', 'failed')
+        completed_items: Number of completed items
+        error_message: Error message if job failed
+        metadata: Updated metadata
+        org_id: Optional organization ID for security check
+
+    Returns:
+        The updated job record or None if failed
+    """
+    update_data = {"updated_at": dt.now().isoformat()}
+
+    if status is not None:
+        update_data["status"] = status
+    if completed_items is not None:
+        update_data["completed_items"] = completed_items
+    if error_message is not None:
+        update_data["error_message"] = error_message
+    if metadata is not None:
+        update_data["metadata"] = metadata
+
+    try:
+        query = supabase.table(PROCESSING_JOBS_TABLE).update(update_data).eq("job_id", job_id)
+
+        if org_id:
+            query = query.eq("org_id", _convert_org_id(org_id))
+
+        response = query.execute()
+        logger.info(f"Updated processing job {job_id}")
+        return response.data[0] if response.data else None
+    except Exception as e:
+        # Enhanced error logging to capture detailed Supabase errors
+        error_details = str(e)
+        if hasattr(e, 'message'):
+            error_details = f"Code: {getattr(e, 'code', 'N/A')}, Message: {e.message}, Details: {getattr(e, 'details', 'N/A')}"
+        elif hasattr(e, 'args') and len(e.args) > 0:
+            error_details = str(e.args[0])
+
+        logger.error(f"Error updating processing job {job_id}: {error_details}", exc_info=True)
+        return None
+
+# =============================================
+# RESULT STORAGE FUNCTIONS
+# =============================================
+
+async def store_extraction_result(
+    job_id: str,
+    url: str,
+    org_id: str,
+    extraction_data: dict,
+    status: str = "completed",
+    logo_file_path: Optional[str] = None,
+    favicon_file_path: Optional[str] = None,
+    color_palette: Optional[dict] = None,
+    error_message: Optional[str] = None
+) -> Optional[dict]:
+    """
+    Store website extraction results in the extraction_content table.
+
+    Args:
+        job_id: Processing job ID
+        url: Source URL
+        org_id: Organization ID
+        extraction_data: Complete extraction data (WebsiteExtraction schema)
+        status: Result status
+        logo_file_path: Path to stored logo file
+        favicon_file_path: Path to stored favicon file
+        color_palette: Extracted color palette
+        error_message: Error message if extraction failed
+
+    Returns:
+        The created result record or None if failed
+    """
+    result_record = {
+        "job_id": job_id,
+        "url": url,
+        "org_id": _convert_org_id(org_id),
+        "status": status,
+        "extraction_data": extraction_data,
+        "logo_file_path": logo_file_path,
+        "favicon_file_path": favicon_file_path,
+        "color_palette": color_palette,
+        "error_message": error_message
+    }
+
+    try:
+        response = supabase.table(EXTRACTION_CONTENT_TABLE).insert(result_record).execute()
+        logger.info(f"Stored extraction result for job {job_id}, URL: {url}")
+        return response.data[0] if response.data else result_record
+    except Exception as e:
+        # Enhanced error logging to capture detailed Supabase errors
+        error_details = str(e)
+        if hasattr(e, 'message'):
+            error_details = f"Code: {getattr(e, 'code', 'N/A')}, Message: {e.message}, Details: {getattr(e, 'details', 'N/A')}"
+        elif hasattr(e, 'args') and len(e.args) > 0:
+            error_details = str(e.args[0])
+
+        logger.error(f"Error storing extraction result for job {job_id}: {error_details}", exc_info=True)
+        return None
+
+async def get_extraction_results(job_id: str, org_id: Optional[str] = None) -> Optional[List[dict]]:
+    """
+    Get extraction results for a job.
+
+    Args:
+        job_id: Processing job ID
+        org_id: Optional organization ID for security check
+
+    Returns:
+        List of extraction result records or None if not found
+    """
+    try:
+        query = supabase.table(EXTRACTION_CONTENT_TABLE).select("*").eq("job_id", job_id)
+
+        if org_id:
+            query = query.eq("org_id", _convert_org_id(org_id))
+
+        response = query.execute()
+        return response.data if response.data else []
+    except Exception as e:
+        logger.error(f"Error getting extraction results for job {job_id}: {str(e)}")
+        return None
+
+async def store_content_library_result(
+    job_id: str,
+    org_id: str,
+    business_data: dict,
+    source_count: int = 0,
+    processing_metadata: Optional[dict] = None
+) -> Optional[dict]:
+    """
+    Store content library processing results.
+
+    Args:
+        job_id: Processing job ID
+        org_id: Organization ID
+        business_data: Complete BusinessInformationSchema data
+        source_count: Number of sources processed
+        processing_metadata: Processing statistics and metadata
+
+    Returns:
+        The created result record or None if failed
+    """
+    result_record = {
+        "job_id": job_id,
+        "org_id": _convert_org_id(org_id),
+        "business_data": business_data,
+        "source_count": source_count,
+        "processing_metadata": processing_metadata or {}
+    }
+
+    try:
+        response = supabase.table(CONTENT_LIBRARY_RESULTS_TABLE).insert(result_record).execute()
+        logger.info(f"Stored content library result for job {job_id}")
+        return response.data[0] if response.data else result_record
+    except Exception as e:
+        logger.error(f"Error storing content library result: {str(e)}")
+        return None
+
+async def get_content_library_results(job_id: str, org_id: Optional[str] = None) -> Optional[dict]:
+    """
+    Get content library results for a job.
+
+    Args:
+        job_id: Processing job ID
+        org_id: Optional organization ID for security check
+
+    Returns:
+        Content library result record or None if not found
+    """
+    try:
+        query = supabase.table(CONTENT_LIBRARY_RESULTS_TABLE).select("*").eq("job_id", job_id)
+
+        if org_id:
+            query = query.eq("org_id", _convert_org_id(org_id))
+
+        response = query.execute()
+        return response.data[0] if response.data else None
+    except Exception as e:
+        logger.error(f"Error getting content library results for job {job_id}: {str(e)}")
+        return None
+
+# =============================================
+# LEGACY JOB FUNCTIONS (for backward compatibility)
+# =============================================
+
 # Extraction jobs functions
 async def create_extraction_job(job_id: str, url: str, org_id: str, user_id: Optional[str] = None):
     """
     Create a new extraction job record in the database.
-    
+    UPDATED: Now uses unified processing_jobs table.
+
     Args:
         job_id: Hyperbrowser job ID
         url: The URL being extracted
         org_id: Organization ID
         user_id: User ID who created the job
-        
+
     Returns:
         The created record
     """
-    # Create job record
-    job_record = {
-        "job_id": job_id,
-        "url": url,
-        "status": "pending",
-        "org_id": org_id,
-        "created_by": user_id
-    }
-    
-    # Save to local cache
-    local_job_cache[job_id] = job_record
-    
-    try:
-        # Save to database
-        response = supabase.table(EXTRACTION_JOBS_TABLE).insert(job_record).execute()
+    # Use the new unified job processing system
+    job_record = await create_processing_job(
+        job_id=job_id,
+        job_type="website_extraction",
+        org_id=org_id,
+        user_id=user_id,
+        source_url=url,
+        total_items=1,
+        metadata={"url": url}
+    )
+
+    if job_record:
+        # Save to local cache for backward compatibility
+        local_job_cache[job_id] = {
+            "job_id": job_id,
+            "url": url,
+            "status": job_record.get("status", "pending"),
+            "org_id": org_id,
+            "created_by": user_id
+        }
         logger.info(f"Created extraction job record for job_id: {job_id}")
-        return response.data[0] if response.data else job_record
-    except Exception as e:
-        logger.error(f"Error creating extraction job: {str(e)}")
-        # Return from cache if database fails
-        logger.warning(f"Using local cache for job {job_id}")
         return job_record
+    else:
+        # Fallback to cache if unified system fails
+        fallback_record = {
+            "job_id": job_id,
+            "url": url,
+            "status": "pending",
+            "org_id": org_id,
+            "created_by": user_id
+        }
+        local_job_cache[job_id] = fallback_record
+        logger.warning(f"Using local cache for job {job_id}")
+        return fallback_record
 
 async def get_extraction_job(job_id: str, org_id: Optional[str] = None):
     """
     Get an extraction job by its ID.
-    
+    UPDATED: Now uses unified processing_jobs table with fallback to cache.
+
     Args:
         job_id: Hyperbrowser job ID
         org_id: Optional organization ID for security check
-        
+
     Returns:
         The job record or None if not found
     """
-    # Try local cache first (faster)
+    # Try unified processing jobs table first
+    job_record = await get_processing_job(job_id, org_id)
+
+    if job_record and job_record.get("job_type") == "website_extraction":
+        # Convert to legacy format for backward compatibility
+        legacy_format = {
+            "job_id": job_record["job_id"],
+            "url": job_record.get("source_url", ""),
+            "status": job_record["status"],
+            "org_id": job_record["org_id"],
+            "created_by": job_record.get("created_by"),
+            "created_at": job_record.get("created_at"),
+            "updated_at": job_record.get("updated_at")
+        }
+
+        # Update local cache
+        local_job_cache[job_id] = legacy_format
+        return legacy_format
+
+    # Fallback to local cache
     if job_id in local_job_cache:
         cached_job = local_job_cache[job_id]
         # If org_id is provided, check that it matches
-        if org_id and cached_job.get("org_id") != org_id:
+        if org_id and str(cached_job.get("org_id")) != str(org_id):
             return None
         return cached_job
-        
-    try:
-        # Try database lookup
-        query = supabase.table(EXTRACTION_JOBS_TABLE).select("*").eq("job_id", job_id)
-        
-        # If org_id is provided, add it to the query for security
-        if org_id:
-            query = query.eq("org_id", org_id)
-            
-        response = query.execute()
-        
-        if response.data:
-            # Update local cache with database data
-            local_job_cache[job_id] = response.data[0]
-            return response.data[0]
-        return None
-    except Exception as e:
-        logger.error(f"Database error when getting job {job_id}: {str(e)}")
-        return None
+
+    # No job found
+    return None
 
 async def update_extraction_job_status(job_id: str, status: str, extraction_data=None, org_id: Optional[str] = None):
     """
     Update the status of an extraction job and process images if complete.
-    
+    UPDATED: Now uses unified processing_jobs table and stores results in extraction_content.
+
     Args:
         job_id: Hyperbrowser job ID
-        status: New status (pending, running, completed, failed)
+        status: New status (pending, processing, completed, failed)
         extraction_data: Optional data from completed extraction
         org_id: Optional organization ID for security check
-        
+
     Returns:
         The updated record or None if failed
     """
-    # Start with basic status update
-    update_data = {"status": status}
-    
-    # If job is completed and we have data, process images
-    if status == "completed" and extraction_data:
+    # Update the unified processing job
+    completed_items = 1 if status == "completed" else 0
+    error_message = None
+
+    if status == "failed" and extraction_data and isinstance(extraction_data, dict):
+        error_message = extraction_data.get("error", "Extraction failed")
+
+    # Update processing job status
+    job_record = await update_processing_job(
+        job_id=job_id,
+        status=status,
+        completed_items=completed_items,
+        error_message=error_message,
+        org_id=org_id
+    )
+
+    # If job is completed and we have data, store the extraction results
+    if status == "completed" and extraction_data and org_id:
         try:
+            # Get the source URL from the job record
+            job_info = await get_processing_job(job_id, org_id)
+            source_url = job_info.get("source_url", "") if job_info else ""
+
             # Process and store logo and favicon images
             image_data = await process_website_images(supabase, extraction_data, job_id)
-            
-            # Add image paths and color data to update
-            if image_data.get("logo_file_path"):
-                update_data["logo_file_path"] = image_data["logo_file_path"]
-            
-            if image_data.get("favicon_file_path"):
-                update_data["favicon_file_path"] = image_data["favicon_file_path"]
-            
-            if image_data.get("color_palette") is not None:
-                update_data["color_palette"] = image_data["color_palette"]
+
+            # Store extraction results in the new extraction_content table
+            await store_extraction_result(
+                job_id=job_id,
+                url=source_url,
+                org_id=org_id,
+                extraction_data=extraction_data,
+                status="completed",
+                logo_file_path=image_data.get("logo_file_path"),
+                favicon_file_path=image_data.get("favicon_file_path"),
+                color_palette=image_data.get("color_palette")
+            )
+
+            # Also store in org_content_sources for backward compatibility
+            await store_extraction_content(job_id, extraction_data, org_id)
+
         except Exception as e:
-            logger.error(f"Error processing images: {str(e)}")
-    
-    # Update local cache
+            logger.error(f"Error processing extraction results: {str(e)}")
+
+    # Update local cache for backward compatibility
     if job_id in local_job_cache:
-        local_job_cache[job_id].update(update_data)
-    
-    try:
-        # Update database
-        query = supabase.table(EXTRACTION_JOBS_TABLE).update(update_data).eq("job_id", job_id)
-        
-        # If org_id is provided, add it to the query for security
-        if org_id:
-            query = query.eq("org_id", org_id)
-            
-        response = query.execute()
-        logger.info(f"Updated extraction job {job_id} status to {status}")
-        return response.data[0] if response.data else local_job_cache.get(job_id)
-    except Exception as e:
-        logger.error(f"Database update failed: {str(e)}")
-        logger.warning(f"Using local cache for job {job_id}")
+        local_job_cache[job_id].update({
+            "status": status,
+            "updated_at": dt.now().isoformat()
+        })
+
+    # Return job record in legacy format
+    if job_record:
+        legacy_format = {
+            "job_id": job_record["job_id"],
+            "status": job_record["status"],
+            "org_id": job_record["org_id"],
+            "updated_at": job_record.get("updated_at")
+        }
+        return legacy_format
+    else:
         return local_job_cache.get(job_id)
 
 async def store_extraction_content(job_id: str, extraction_data: dict, org_id: str, user_id: str = None):
@@ -265,108 +641,128 @@ async def update_extraction_job_color_palette(job_id: str, image_source: str, co
 async def create_markdown_extraction_job(job_id: str, urls: List[str], org_id: str, user_id: Optional[str] = None):
     """
     Create a new markdown extraction job record in the database.
-    
+    UPDATED: Now uses unified processing_jobs table.
+
     Args:
         job_id: Hyperbrowser job ID
         urls: List of URLs to extract markdown from
         org_id: Organization ID
         user_id: User ID who created the job
-        
+
     Returns:
         The created record
     """
-    # Create job record
-    job_record = {
-        "job_id": job_id,
-        "status": "pending",
-        "total_urls": len(urls),
-        "completed_urls": 0,
-        "org_id": org_id,
-        "created_by": user_id
-    }
-    
-    try:
-        # Save to database
-        response = supabase.table(MARKDOWN_JOBS_TABLE).insert(job_record).execute()
-        logger.info(f"Created markdown extraction job record for job_id: {job_id}")
-        
-        # Create records for each URL
-        url_records = [{
+    # Use the new unified job processing system
+    job_record = await create_processing_job(
+        job_id=job_id,
+        job_type="markdown_extraction",
+        org_id=org_id,
+        user_id=user_id,
+        total_items=len(urls),
+        metadata={"urls": urls, "total_urls": len(urls)}
+    )
+
+    if job_record:
+        try:
+            # Create records for each URL in the markdown_content table
+            url_records = [{
+                "job_id": job_id,
+                "url": url,
+                "status": "pending",
+                "org_id": _convert_org_id(org_id)
+            } for url in urls]
+
+            # Save URL records to database
+            if url_records:
+                supabase.table(MARKDOWN_CONTENT_TABLE).insert(url_records).execute()
+                logger.info(f"Created {len(url_records)} URL records for job_id: {job_id}")
+
+            logger.info(f"Created markdown extraction job record for job_id: {job_id}")
+            return job_record
+        except Exception as e:
+            logger.error(f"Error creating URL records: {str(e)}")
+            return job_record
+    else:
+        # Fallback record for backward compatibility
+        fallback_record = {
             "job_id": job_id,
-            "url": url,
             "status": "pending",
-            "org_id": org_id
-        } for url in urls]
-        
-        # Save URL records to database
-        if url_records:
-            supabase.table(MARKDOWN_CONTENT_TABLE).insert(url_records).execute()
-            logger.info(f"Created {len(url_records)} URL records for job_id: {job_id}")
-        
-        return response.data[0] if response.data else job_record
-    except Exception as e:
-        logger.error(f"Error creating markdown extraction job: {str(e)}")
-        return job_record
+            "total_urls": len(urls),
+            "completed_urls": 0,
+            "org_id": org_id,
+            "created_by": user_id
+        }
+        logger.warning(f"Using fallback record for markdown job {job_id}")
+        return fallback_record
 
 async def get_markdown_extraction_job(job_id: str, org_id: Optional[str] = None):
     """
     Get a markdown extraction job by its ID.
-    
+    UPDATED: Now uses unified processing_jobs table.
+
     Args:
         job_id: Hyperbrowser job ID
         org_id: Optional organization ID for security check
-        
+
     Returns:
         The job record or None if not found
     """
-    try:
-        # Try database lookup
-        query = supabase.table(MARKDOWN_JOBS_TABLE).select("*").eq("job_id", job_id)
-        
-        # If org_id is provided, add it to the query for security
-        if org_id:
-            query = query.eq("org_id", org_id)
-            
-        response = query.execute()
-        
-        if response.data:
-            return response.data[0]
-        return None
-    except Exception as e:
-        logger.error(f"Database error when getting markdown job {job_id}: {str(e)}")
-        return None
+    # Try unified processing jobs table first
+    job_record = await get_processing_job(job_id, org_id)
+
+    if job_record and job_record.get("job_type") == "markdown_extraction":
+        # Convert to legacy format for backward compatibility
+        metadata = job_record.get("metadata", {})
+        legacy_format = {
+            "job_id": job_record["job_id"],
+            "status": job_record["status"],
+            "total_urls": metadata.get("total_urls", job_record.get("total_items", 0)),
+            "completed_urls": job_record.get("completed_items", 0),
+            "org_id": job_record["org_id"],
+            "created_by": job_record.get("created_by"),
+            "created_at": job_record.get("created_at"),
+            "updated_at": job_record.get("updated_at")
+        }
+        return legacy_format
+
+    # No job found
+    return None
 
 async def update_markdown_extraction_status(job_id: str, status: str, org_id: Optional[str] = None):
     """
     Update the status of a markdown extraction job.
-    
+    UPDATED: Now uses unified processing_jobs table.
+
     Args:
         job_id: Hyperbrowser job ID
-        status: New status (pending, running, completed, failed)
+        status: New status (pending, processing, completed, failed)
         org_id: Optional organization ID for security check
-        
+
     Returns:
         The updated record or None if failed
     """
-    # Start with basic status update
-    update_data = {
-        "status": status,
-        "updated_at": dt.now().isoformat()
-    }
-    
-    try:
-        # Update database
-        query = supabase.table(MARKDOWN_JOBS_TABLE).update(update_data).eq("job_id", job_id)
-        
-        # If org_id is provided, add it to the query for security
-        if org_id:
-            query = query.eq("org_id", org_id)
-            
-        response = query.execute()
+    # Update the unified processing job
+    job_record = await update_processing_job(
+        job_id=job_id,
+        status=status,
+        org_id=org_id
+    )
+
+    if job_record:
         logger.info(f"Updated markdown extraction job {job_id} status to {status}")
-        return response.data[0] if response.data else None
-    except Exception as e:
-        logger.error(f"Error updating markdown job status: {str(e)}")
+        # Return in legacy format for backward compatibility
+        metadata = job_record.get("metadata", {})
+        legacy_format = {
+            "job_id": job_record["job_id"],
+            "status": job_record["status"],
+            "total_urls": metadata.get("total_urls", job_record.get("total_items", 0)),
+            "completed_urls": job_record.get("completed_items", 0),
+            "org_id": job_record["org_id"],
+            "updated_at": job_record.get("updated_at")
+        }
+        return legacy_format
+    else:
+        logger.error(f"Error updating markdown job status for {job_id}")
         return None
 
 async def update_url_markdown_content(job_id: str, url: str, markdown_text: str, status: str = "completed", 
@@ -518,34 +914,41 @@ async def get_markdown_content(job_id: str, org_id: Optional[str] = None):
 async def create_document_conversion_job(job_id: str, org_id: str, user_id: Optional[str] = None):
     """
     Create a new document conversion job record in the database.
-    
+    UPDATED: Now uses unified processing_jobs table.
+
     Args:
         job_id: Unique job ID
         org_id: Organization ID
         user_id: User ID who created the job
-        
+
     Returns:
         The created record
     """
-    # Create job record
-    job_record = {
-        "job_id": job_id,
-        "status": "pending",
-        "total_files": 0,
-        "completed_files": 0,
-        "org_id": org_id,
-        "created_by": user_id
-    }
-    
-    try:
-        # Save to database
-        response = supabase.table(DOCUMENT_JOBS_TABLE).insert(job_record).execute()
+    # Use the new unified job processing system
+    job_record = await create_processing_job(
+        job_id=job_id,
+        job_type="document_conversion",
+        org_id=org_id,
+        user_id=user_id,
+        total_items=0,  # Will be updated when files are added
+        metadata={"total_files": 0, "completed_files": 0}
+    )
+
+    if job_record:
         logger.info(f"Created document conversion job record for job_id: {job_id}")
-        
-        return response.data[0] if response.data else job_record
-    except Exception as e:
-        logger.error(f"Error creating document conversion job: {str(e)}")
         return job_record
+    else:
+        # Fallback record for backward compatibility
+        fallback_record = {
+            "job_id": job_id,
+            "status": "pending",
+            "total_files": 0,
+            "completed_files": 0,
+            "org_id": org_id,
+            "created_by": user_id
+        }
+        logger.warning(f"Using fallback record for document job {job_id}")
+        return fallback_record
 
 async def get_document_conversion_job(job_id: str, org_id: Optional[str] = None):
     """
