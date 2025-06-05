@@ -1,9 +1,10 @@
 """
-API endpoints for website data extraction - FIXED VERSION
+Enhanced API endpoints for comprehensive website data extraction.
 """
 from fastapi import APIRouter, HTTPException, Path, Depends
 from hyperbrowser import Hyperbrowser
 from hyperbrowser.models import StartExtractJobParams
+import json
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -29,7 +30,7 @@ router = APIRouter()
 @router.post("/extract", response_model=ExtractionResponse, status_code=202)
 async def start_extraction(request: ExtractionRequest, user_id: int = Depends(get_current_user_id)):
     """
-    Start a website data extraction job with structured schema.
+    Start a comprehensive website data extraction job.
     """
     url = str(request.url)
     logger.info(f"Received extraction request for URL: {url}")
@@ -55,19 +56,19 @@ async def start_extraction(request: ExtractionRequest, user_id: int = Depends(ge
         # Create the extraction parameters
         extraction_prompt = METADATA_AND_LINKS_EXTRACTION_PROMPT.format(TARGET_URL=url)
         
-        # Generate schema and log it ONCE
+        # Generate schema and log it
         schema_json = WebsiteExtraction.model_json_schema()
-        logger.info(f"Schema properties count: {len(schema_json.get('properties', {}))}")
-        logger.info(f"Using structured schema with proper field definitions")
+        logger.info(f"Enhanced schema with {len(schema_json.get('properties', {}))} top-level properties")
+        logger.info(f"Schema includes: {list(schema_json.get('properties', {}).keys())}")
         
-        # Start the extraction job
+        # Start the extraction job with enhanced parameters
         job_response = client.extract.start(
             params=StartExtractJobParams(
                 urls=[url],
                 prompt=extraction_prompt,
                 schema=WebsiteExtraction,
-                waitFor=2000,  # Wait for page load
-                maxLinks=15,   # Limit for free tier
+                waitFor=3000,  # Wait longer for complex sites
+                maxLinks=25,   # More links for comprehensive analysis
             )
         )
         
@@ -76,7 +77,7 @@ async def start_extraction(request: ExtractionRequest, user_id: int = Depends(ge
             raise HTTPException(status_code=500, detail="Failed to start extraction job")
         
         hyperbrowser_job_id = job_response.job_id
-        logger.info(f"Started extraction job {hyperbrowser_job_id} for URL: {url}")
+        logger.info(f"Started enhanced extraction job {hyperbrowser_job_id} for URL: {url}")
         
         # Store job in database
         job_record = await create_extraction_job(hyperbrowser_job_id, url, org_id, user_id)
@@ -88,7 +89,7 @@ async def start_extraction(request: ExtractionRequest, user_id: int = Depends(ge
             job_id=hyperbrowser_job_id,
             org_id=str(org_id),
             status="pending",
-            message="Extraction job started successfully with structured schema"
+            message="Enhanced extraction job started successfully"
         )
         
     except HTTPException:
@@ -192,11 +193,28 @@ async def get_extraction_result(job_id: str = Path(..., description="Hyperbrowse
                 error="No data returned from extraction"
             )
         
-        # Log raw data for debugging (but don't spam)
+        # Log comprehensive data analysis
         if isinstance(result.data, dict):
-            logger.info(f"Extracted data has {len(result.data)} fields")
+            total_fields = len(result.data)
             non_empty_fields = [k for k, v in result.data.items() if v not in [None, {}, []]]
-            logger.info(f"Non-empty fields: {non_empty_fields}")
+            empty_fields = [k for k, v in result.data.items() if v in [None, {}, []]]
+            
+            logger.info(f"Extraction Analysis for {job_id}:")
+            logger.info(f"  Total fields: {total_fields}")
+            logger.info(f"  Non-empty fields ({len(non_empty_fields)}): {non_empty_fields}")
+            logger.info(f"  Empty fields ({len(empty_fields)}): {empty_fields}")
+            
+            # Log specific content types
+            if result.data.get("color_palette"):
+                logger.info(f"  Color palette extracted: {result.data['color_palette']}")
+            if result.data.get("brand_fonts"):
+                logger.info(f"  Brand fonts extracted: {result.data['brand_fonts']}")
+            if result.data.get("link_analysis") and result.data["link_analysis"].get("links"):
+                link_count = len(result.data["link_analysis"]["links"])
+                logger.info(f"  Links analyzed: {link_count}")
+            if result.data.get("social_profiles"):
+                active_socials = [k for k, v in result.data["social_profiles"].items() if v]
+                logger.info(f"  Social profiles found: {active_socials}")
         
         try:
             # Validate data and create response object
@@ -206,7 +224,19 @@ async def get_extraction_result(job_id: str = Path(..., description="Hyperbrowse
             await update_extraction_job_status(job_id, result.status, result.data, org_id)
             await store_extraction_content(job_id, result.data, org_id, user_id)
 
-            logger.info(f"Successfully processed extraction data for job {job_id}")
+            # Process logo/favicon if present (with better error handling)
+            if extracted_data.logo and extracted_data.logo.url:
+                try:
+                    from app.utils.logo_downloader import process_website_images
+                    image_result = await process_website_images(extracted_data.logo.url, job_id, org_id)
+                    if image_result.get("error"):
+                        logger.warning(f"Logo processing warning: {image_result['error']}")
+                    else:
+                        logger.info(f"Logo processed successfully: {image_result.get('logo_file_path')}")
+                except Exception as img_error:
+                    logger.warning(f"Logo processing failed (non-critical): {str(img_error)}")
+
+            logger.info(f"Successfully processed comprehensive extraction data for job {job_id}")
             return ExtractionResultResponse(
                 job_id=job_id,
                 org_id=str(org_id),
@@ -235,23 +265,86 @@ async def get_extraction_result(job_id: str = Path(..., description="Hyperbrowse
 # Test endpoints
 @router.get("/schema", response_model=dict)
 async def get_extraction_schema():
-    """Get the JSON schema being sent to Hyperbrowser."""
+    """Get the enhanced JSON schema being sent to Hyperbrowser."""
     try:
         schema = WebsiteExtraction.model_json_schema()
+        
+        # Analyze schema structure
+        properties = schema.get("properties", {})
+        nested_models = []
+        
+        for prop_name, prop_def in properties.items():
+            if "$ref" in str(prop_def):
+                nested_models.append(prop_name)
+        
         return {
             "schema": schema,
-            "properties_count": len(schema.get("properties", {})),
-            "required_fields": schema.get("required", []),
-            "property_names": list(schema.get("properties", {}).keys())
+            "analysis": {
+                "total_properties": len(properties),
+                "required_fields": schema.get("required", []),
+                "property_names": list(properties.keys()),
+                "nested_models": nested_models,
+                "definitions_count": len(schema.get("definitions", {}))
+            }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating schema: {str(e)}")
 
 @router.post("/test-schema", response_model=WebsiteExtraction)
 async def test_schema_validation(data: dict):
-    """Test schema validation with sample data."""
+    """Test enhanced schema validation with sample data."""
     try:
         validated_data = WebsiteExtraction(**data)
         return validated_data
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Schema validation failed: {str(e)}")
+
+@router.post("/test-extraction", response_model=dict)
+async def test_sample_extraction():
+    """Test with sample Apple-like data structure."""
+    sample_data = {
+        "url": "https://example.com",
+        "favicon": "https://example.com/favicon.ico",
+        "logo": {
+            "url": "https://example.com/logo.png",
+            "alt_text": "Example Company Logo"
+        },
+        "color_palette": ["#FF0000", "#00FF00", "#0000FF"],
+        "brand_fonts": {
+            "primary": "Helvetica Neue",
+            "secondary": "Arial"
+        },
+        "company": {
+            "name": "Example Corp",
+            "description": "Leading example company",
+            "industry": "Technology",
+            "location": "San Francisco, CA"
+        },
+        "social_profiles": {
+            "linkedin": "https://linkedin.com/company/example",
+            "twitter": "https://twitter.com/example"
+        },
+        "legal_links": {
+            "terms_of_service": "https://example.com/terms",
+            "privacy_policy": "https://example.com/privacy"
+        },
+        "seo_data": {
+            "meta_title": "Example Corp - Technology Leader",
+            "meta_description": "Leading technology company",
+            "h1": "Welcome to Example Corp"
+        },
+        "key_services": ["Software Development", "Consulting", "Support"]
+    }
+    
+    try:
+        validated = WebsiteExtraction(**sample_data)
+        return {
+            "status": "success",
+            "message": "Enhanced schema validation successful",
+            "validated_data": validated.dict()
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Schema validation failed: {str(e)}"
+        }

@@ -1,7 +1,8 @@
 """
-Utility functions for downloading and storing website images.
+Fixed utility functions for downloading and storing website images.
 """
 import requests
+import json
 from io import BytesIO
 from PIL import Image
 from urllib.parse import urlparse
@@ -48,6 +49,29 @@ async def download_image(image_url: str) -> tuple:
         logger.warning(f"Error downloading image: {str(e)}")
         return None, None, None
 
+async def ensure_bucket_exists():
+    """
+    Ensure the storage bucket exists, create if it doesn't.
+    """
+    try:
+        # Try to get bucket info
+        supabase.storage.get_bucket(BUCKET_NAME)
+        logger.info(f"Bucket '{BUCKET_NAME}' exists")
+        return True
+    except Exception as e:
+        logger.info(f"Bucket '{BUCKET_NAME}' not found, attempting to create...")
+        try:
+            # Create the bucket
+            supabase.storage.create_bucket(
+                BUCKET_NAME, 
+                {"public": True}  # Make it public for easy access
+            )
+            logger.info(f"Successfully created bucket '{BUCKET_NAME}'")
+            return True
+        except Exception as create_error:
+            logger.error(f"Failed to create bucket '{BUCKET_NAME}': {str(create_error)}")
+            return False
+
 async def store_image_in_supabase(image_data, content_type, file_extension, job_id: str, image_type: str) -> str:
     """
     Store an image in Supabase storage.
@@ -66,6 +90,12 @@ async def store_image_in_supabase(image_data, content_type, file_extension, job_
         return None
         
     try:
+        # Ensure bucket exists
+        bucket_ready = await ensure_bucket_exists()
+        if not bucket_ready:
+            logger.error("Cannot store image: bucket creation failed")
+            return None
+        
         # Create path for storing the image
         file_name = f"{job_id}_{image_type}{file_extension}"
         file_path = f"jobs/{job_id}/{file_name}"
@@ -73,17 +103,22 @@ async def store_image_in_supabase(image_data, content_type, file_extension, job_
         # Upload to Supabase storage
         logger.info(f"Uploading {image_type} to storage: {file_path}")
         
-        # Upload the file
-        supabase.storage.from_(BUCKET_NAME).upload(
-            file_path,
-            image_data,
-            {"content-type": content_type}
-        )
-        
-        # Get the public URL
-        file_url = supabase.storage.from_(BUCKET_NAME).get_public_url(file_path)
-        logger.info(f"Uploaded {image_type} successfully")
-        return file_url
+        try:
+            # Upload the file
+            upload_response = supabase.storage.from_(BUCKET_NAME).upload(
+                file_path,
+                image_data,
+                {"content-type": content_type, "upsert": "true"}
+            )
+            
+            # Get the public URL
+            file_url = supabase.storage.from_(BUCKET_NAME).get_public_url(file_path)
+            logger.info(f"Uploaded {image_type} successfully to: {file_url}")
+            return file_url
+            
+        except Exception as upload_error:
+            logger.error(f"Upload failed for {image_type}: {str(upload_error)}")
+            return None
         
     except Exception as e:
         logger.error(f"Error storing {image_type}: {str(e)}")
@@ -133,7 +168,7 @@ async def process_website_images(logo_url: str, job_id: str, org_id: int) -> dic
                 except Exception as e:
                     logger.error(f"Error updating extraction content with logo path: {str(e)}")
             else:
-                result["error"] = "Failed to store logo in Supabase"
+                result["error"] = "Failed to store logo in Supabase storage"
         else:
             result["error"] = "Failed to download logo"
             
@@ -187,7 +222,7 @@ async def process_favicon(favicon_url: str, job_id: str, org_id: int) -> dict:
                 except Exception as e:
                     logger.error(f"Error updating extraction content with favicon path: {str(e)}")
             else:
-                result["error"] = "Failed to store favicon in Supabase"
+                result["error"] = "Failed to store favicon in Supabase storage"
         else:
             result["error"] = "Failed to download favicon"
             
