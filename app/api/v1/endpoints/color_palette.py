@@ -16,19 +16,19 @@ router = APIRouter()
 @router.get("/extract", response_model=ColorPaletteResponse)
 async def extract_colors(
     image_source: str = Query(..., description="URL or path of the image to extract colors from"),
-    org_id: str = Query(..., description="Organization ID to associate with this extraction"),
+    org_id: int = Query(..., description="Organization ID to associate with this extraction"),
     background_tasks: BackgroundTasks = None,
     palette_size: Optional[int] = Query(5, ge=3, le=10, description="Number of colors to extract (between 3-10)"),
-    user_id: str = Depends(get_current_user_id)
+    user_id: int = Depends(get_current_user_id)
 ) -> ColorPaletteResponse:
     """
     Extract color palette from an image.
     
     Args:
         image_source: URL or path of the image to extract colors from
-        org_id: Organization ID to associate with this extraction
+        org_id: Organization ID to associate with this extraction (integer)
         palette_size: Number of colors to extract (between 3-10)
-        user_id: Authenticated user ID
+        user_id: Authenticated user ID (integer)
         
     Returns:
         ColorPaletteResponse: The extracted color palette information
@@ -58,7 +58,7 @@ async def extract_colors(
                 job_id=job_id,
                 image_source=image_source,
                 colors=colors,
-                org_id=org_id  # Use the org_id from query parameters
+                org_id=org_id  # Now using integer org_id
             )
         
         # Return the colors immediately

@@ -1,13 +1,13 @@
 """
-Simple utility functions for downloading and storing website images.
+Utility functions for downloading and storing website images.
 """
 import requests
-import json
 from io import BytesIO
 from PIL import Image
 from urllib.parse import urlparse
 import os
 from app.core.logging import logger
+from app.core.database import supabase
 
 # Name of the Supabase storage bucket
 BUCKET_NAME = "websiteassets"
@@ -48,16 +48,15 @@ async def download_image(image_url: str) -> tuple:
         logger.warning(f"Error downloading image: {str(e)}")
         return None, None, None
 
-async def store_image_in_supabase(supabase_client, image_data, content_type, file_extension, job_id: str, image_type: str) -> str:
+async def store_image_in_supabase(image_data, content_type, file_extension, job_id: str, image_type: str) -> str:
     """
     Store an image in Supabase storage.
     
     Args:
-        supabase_client: Initialized Supabase client
         image_data: Raw image data
         content_type: MIME type of the image
         file_extension: File extension (including .)
-        job_id: The job ID 
+        job_id: The job ID (UUID string)
         image_type: Type of image ('logo' or 'favicon')
         
     Returns:
@@ -75,14 +74,14 @@ async def store_image_in_supabase(supabase_client, image_data, content_type, fil
         logger.info(f"Uploading {image_type} to storage: {file_path}")
         
         # Upload the file
-        supabase_client.storage.from_(BUCKET_NAME).upload(
+        supabase.storage.from_(BUCKET_NAME).upload(
             file_path,
             image_data,
             {"content-type": content_type}
         )
         
         # Get the public URL
-        file_url = supabase_client.storage.from_(BUCKET_NAME).get_public_url(file_path)
+        file_url = supabase.storage.from_(BUCKET_NAME).get_public_url(file_path)
         logger.info(f"Uploaded {image_type} successfully")
         return file_url
         
@@ -90,48 +89,110 @@ async def store_image_in_supabase(supabase_client, image_data, content_type, fil
         logger.error(f"Error storing {image_type}: {str(e)}")
         return None
 
-async def process_website_images(supabase_client, extraction_data: dict, job_id: str) -> dict:
+async def process_website_images(logo_url: str, job_id: str, org_id: int) -> dict:
     """
-    Process and store logo and favicon from extraction data.
+    Process and store logo from extraction data.
     
     Args:
-        supabase_client: Initialized Supabase client
-        extraction_data: The extraction result data
-        job_id: The job ID
+        logo_url: URL of the logo to download
+        job_id: The job ID (UUID string)
+        org_id: Organization ID (integer)
         
     Returns:
-        dict: Paths to stored images and color palette
+        dict: Result of image processing
     """
     result = {
         "logo_file_path": None,
-        "favicon_file_path": None,
-        "color_palette": None
+        "error": None
     }
     
-    # 1. Store color palette if available
-    if extraction_data and "color_palette" in extraction_data:
-        result["color_palette"] = extraction_data["color_palette"]
+    if not logo_url:
+        result["error"] = "No logo URL provided"
+        return result
     
-    # 2. Process favicon
-    if extraction_data and extraction_data.get("favicon"):
-        favicon_url = extraction_data["favicon"]
-        favicon_data, favicon_type, favicon_ext = await download_image(favicon_url)
-        
-        if favicon_data:
-            favicon_path = await store_image_in_supabase(
-                supabase_client, favicon_data, favicon_type, favicon_ext, job_id, "favicon"
-            )
-            result["favicon_file_path"] = favicon_path
-    
-    # 3. Process logo
-    if extraction_data and extraction_data.get("logo") and extraction_data["logo"].get("url"):
-        logo_url = extraction_data["logo"]["url"]
+    try:
+        # Download logo
         logo_data, logo_type, logo_ext = await download_image(logo_url)
         
         if logo_data:
             logo_path = await store_image_in_supabase(
-                supabase_client, logo_data, logo_type, logo_ext, job_id, "logo"
+                logo_data, logo_type, logo_ext, job_id, "logo"
             )
-            result["logo_file_path"] = logo_path
+            
+            if logo_path:
+                result["logo_file_path"] = logo_path
+                
+                # Update extraction content record with logo path
+                try:
+                    from app.core.database import supabase
+                    supabase.table("extraction_content").update({
+                        "logo_file_path": logo_path
+                    }).eq("job_id", job_id).eq("org_id", org_id).execute()
+                    
+                    logger.info(f"Updated extraction content with logo path for job {job_id}")
+                except Exception as e:
+                    logger.error(f"Error updating extraction content with logo path: {str(e)}")
+            else:
+                result["error"] = "Failed to store logo in Supabase"
+        else:
+            result["error"] = "Failed to download logo"
+            
+    except Exception as e:
+        logger.error(f"Error processing logo: {str(e)}")
+        result["error"] = str(e)
+            
+    return result
+
+async def process_favicon(favicon_url: str, job_id: str, org_id: int) -> dict:
+    """
+    Process and store favicon from extraction data.
+    
+    Args:
+        favicon_url: URL of the favicon to download
+        job_id: The job ID (UUID string)
+        org_id: Organization ID (integer)
+        
+    Returns:
+        dict: Result of favicon processing
+    """
+    result = {
+        "favicon_file_path": None,
+        "error": None
+    }
+    
+    if not favicon_url:
+        result["error"] = "No favicon URL provided"
+        return result
+    
+    try:
+        # Download favicon
+        favicon_data, favicon_type, favicon_ext = await download_image(favicon_url)
+        
+        if favicon_data:
+            favicon_path = await store_image_in_supabase(
+                favicon_data, favicon_type, favicon_ext, job_id, "favicon"
+            )
+            
+            if favicon_path:
+                result["favicon_file_path"] = favicon_path
+                
+                # Update extraction content record with favicon path
+                try:
+                    from app.core.database import supabase
+                    supabase.table("extraction_content").update({
+                        "favicon_file_path": favicon_path
+                    }).eq("job_id", job_id).eq("org_id", org_id).execute()
+                    
+                    logger.info(f"Updated extraction content with favicon path for job {job_id}")
+                except Exception as e:
+                    logger.error(f"Error updating extraction content with favicon path: {str(e)}")
+            else:
+                result["error"] = "Failed to store favicon in Supabase"
+        else:
+            result["error"] = "Failed to download favicon"
+            
+    except Exception as e:
+        logger.error(f"Error processing favicon: {str(e)}")
+        result["error"] = str(e)
             
     return result
