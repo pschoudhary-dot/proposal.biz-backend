@@ -19,3 +19,4 @@ langchain-text-splitters
 langfuse
 openrouter
 instructor
+apify-client

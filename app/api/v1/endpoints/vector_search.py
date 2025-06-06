@@ -13,6 +13,10 @@ from app.schemas.vector_search import (
     VectorSearchResponse,
     ProcessDocumentResponse
 )
+from app.core.database import (
+    create_org_content_source_record,
+    get_user_organizations
+)
 
 router = APIRouter()
 
@@ -20,10 +24,10 @@ router = APIRouter()
 @router.post("/process-document", response_model=ProcessDocumentResponse)
 async def convert_document_to_vectors(
     file: UploadFile = File(...),
-    document_id: Optional[str] = Form(None),
-    org_id: str = Form(...),
+    source_id: Optional[str] = Form(None),
+    org_id: Optional[int] = Form(None),
     use_semantic_chunking: bool = Form(True),
-    user_id: str = Depends(get_current_user_id)
+    user_id: int = Depends(get_current_user_id)
 ):
     """
     Process a document by chunking it semantically and creating vector embeddings.
@@ -34,11 +38,27 @@ async def convert_document_to_vectors(
     Returns a list of chunk IDs that were created.
     """
     try:
-        # Generate a document ID if not provided
-        if not document_id:
-            document_id = str(uuid.uuid4())
+        # Get org_id if not provided
+        if not org_id:
+            orgs = await get_user_organizations(user_id)
+            if not orgs:
+                raise HTTPException(status_code=400, detail="User is not a member of any organization")
+            org_id = orgs[0]["org_id"]
+        
+        # Generate a source ID if not provided
+        if not source_id:
+            # Create a content source record first
+            source_id = await create_org_content_source_record(
+                job_id=str(uuid.uuid4()),
+                filename=file.filename,
+                org_id=org_id,
+                user_id=user_id
+            )
             
-        logger.info(f"Processing document {file.filename} with ID {document_id}")
+            if not source_id:
+                raise HTTPException(status_code=500, detail="Failed to create content source record")
+        
+        logger.info(f"Processing document {file.filename} with source ID {source_id}")
         
         # Read file content
         content = await file.read()
@@ -52,9 +72,9 @@ async def convert_document_to_vectors(
         
         # Process the document
         chunk_ids = await process_document(
-            document_id=document_id,
-            org_id=org_id,
-            user_id=user_id,
+            source_id=source_id,     # UUID string
+            org_id=org_id,           # Integer
+            user_id=user_id,         # Integer
             text=text,
             metadata=metadata,
             use_semantic_chunking=use_semantic_chunking
@@ -64,7 +84,7 @@ async def convert_document_to_vectors(
             raise HTTPException(status_code=500, detail="Failed to process document")
         
         return ProcessDocumentResponse(
-            document_id=document_id,
+            document_id=source_id,
             chunk_count=len(chunk_ids),
             chunk_ids=chunk_ids,
             message="Document processed successfully"
@@ -78,7 +98,7 @@ async def convert_document_to_vectors(
 @router.post("/search", response_model=VectorSearchResponse)
 async def search_documents(
     request: VectorSearchRequest,
-    user_id: str = Depends(get_current_user_id)
+    user_id: int = Depends(get_current_user_id)
 ):
     """
     Search for documents similar to the query text.
@@ -91,10 +111,13 @@ async def search_documents(
     try:
         logger.info(f"Searching for documents similar to query: {request.query[:50]}...")
         
+        # Convert org_id from string to integer if needed
+        org_id = int(request.org_id) if isinstance(request.org_id, str) else request.org_id
+        
         # Perform similarity search
         results = await similarity_search(
             query=request.query,
-            org_id=request.org_id,
+            org_id=org_id,           # Integer
             limit=request.limit,
             threshold=request.threshold
         )

@@ -158,44 +158,43 @@ class DocumentVectorizer:
             return []
     
     async def store_document_chunks(self, 
-                                 document_id: str,
-                                 org_id: str,
-                                 user_id: str,
+                                 source_id: str,  # UUID string for content source
+                                 org_id: int,     # Integer org ID
+                                 user_id: int,    # Integer user ID
                                  document_chunks: List[Tuple[Document, List[float]]]) -> List[str]:
         """Store document chunks and their embeddings in the database.
         
         Args:
-            document_id: ID of the original document (used as source_id in the database)
-            org_id: Organization ID
-            user_id: User ID (not stored in ContentChunks, but used in metadata)
+            source_id: ID of the content source (UUID string)
+            org_id: Organization ID (integer)
+            user_id: User ID (integer) - used in metadata only
             document_chunks: List of (document, embedding) tuples
             
         Returns:
             List of chunk IDs that were stored
         """
         try:
-            logger.info(f"Storing {len(document_chunks)} chunks for document {document_id}")
+            logger.info(f"Storing {len(document_chunks)} chunks for source {source_id}")
             
             chunk_ids = []
             
             for idx, (doc, embedding) in enumerate(document_chunks):
-                # Generate a unique ID for the chunk
+                # Generate a unique UUID for the chunk
                 chunk_id = str(uuid.uuid4())
                 
-                # Prepare chunk data for storage according to ContentChunks schema
+                # Prepare chunk data for storage according to content_chunks schema
                 chunk_data = {
-                    "id": chunk_id,
-                    "source_id": document_id,
-                    "org_id": org_id,
-                    "chunk_index": idx,
-                    "chunk_text": doc.page_content,
-                    "chunk_metadata": {
+                    "id": chunk_id,                    # UUID
+                    "source_id": source_id,            # UUID (references org_content_sources.id)
+                    "org_id": org_id,                  # Integer
+                    "chunk_index": idx,                # Integer
+                    "chunk_text": doc.page_content,    # Text
+                    "chunk_metadata": {                # JSONB
                         **doc.metadata,  
                         "user_id": user_id, 
                         "chunk_id": chunk_id
                     },
-                    "embedding": embedding
-
+                    "embedding": embedding             # vector(1536)
                 }
                 
                 # Store chunk in database
@@ -220,32 +219,32 @@ class DocumentVectorizer:
             True if successful, False otherwise
         """
         try:
-            # Insert chunk into contentchunks table
-            response = self.supabase.table("contentchunks").insert(chunk_data).execute()
+            # Insert chunk into content_chunks table
+            response = self.supabase.table("content_chunks").insert(chunk_data).execute()
             
             # Check if insertion was successful
             if response.data and len(response.data) > 0:
                 return True
             else:
-                logger.error(f"Failed to insert chunk: {response.error}")
+                logger.error(f"Failed to insert chunk: {response}")
                 return False
         except Exception as e:
             logger.error(f"Database error storing chunk: {str(e)}")
             return False
     
     async def process_document(self,
-                            document_id: str,
-                            org_id: str,
-                            user_id: str,
+                            source_id: str,           # UUID string for content source
+                            org_id: int,              # Integer org ID
+                            user_id: int,             # Integer user ID
                             text: str,
                             metadata: Dict[str, Any] = None,
                             use_semantic_chunking: bool = True) -> List[str]:
         """Process a document by chunking, embedding, and storing in the database.
         
         Args:
-            document_id: ID of the document
-            org_id: Organization ID
-            user_id: User ID
+            source_id: ID of the content source (UUID string)
+            org_id: Organization ID (integer)
+            user_id: User ID (integer)
             text: Text content of the document
             metadata: Metadata for the document
             use_semantic_chunking: Whether to use semantic chunking (True) or recursive chunking (False)
@@ -254,12 +253,12 @@ class DocumentVectorizer:
             List of chunk IDs that were stored
         """
         try:
-            logger.info(f"Processing document {document_id} for organization {org_id}")
+            logger.info(f"Processing document for source {source_id} in organization {org_id}")
             
-            # Add document ID to metadata
+            # Add source ID to metadata
             if metadata is None:
                 metadata = {}
-            metadata["source_id"] = document_id
+            metadata["source_id"] = source_id
             metadata["org_id"] = org_id
             
             # Chunk the document
@@ -272,23 +271,23 @@ class DocumentVectorizer:
             document_chunks = self.embed_documents(chunks)
             
             # Store chunks in database
-            chunk_ids = await self.store_document_chunks(document_id, org_id, user_id, document_chunks)
+            chunk_ids = await self.store_document_chunks(source_id, org_id, user_id, document_chunks)
             
             return chunk_ids
         except Exception as e:
-            logger.error(f"Error processing document {document_id}: {str(e)}")
+            logger.error(f"Error processing document for source {source_id}: {str(e)}")
             return []
     
     async def similarity_search(self,
                              query: str,
-                             org_id: str,
+                             org_id: int,              # Integer org ID
                              limit: int = 5,
                              threshold: float = 0.7) -> List[Dict[str, Any]]:
         """Search for chunks similar to the query.
         
         Args:
             query: The search query
-            org_id: Organization ID to filter results
+            org_id: Organization ID (integer) to filter results
             limit: Maximum number of results to return
             threshold: Similarity threshold (0-1)
             
@@ -328,20 +327,20 @@ document_vectorizer = DocumentVectorizer()
 
 
 # Convenience functions to use the singleton instance
-async def process_document(document_id: str,
-                         org_id: str,
-                         user_id: str,
+async def process_document(source_id: str,           # UUID string
+                         org_id: int,                # Integer
+                         user_id: int,               # Integer
                          text: str,
                          metadata: Dict[str, Any] = None,
                          use_semantic_chunking: bool = True) -> List[str]:
     """Process a document by chunking, embedding, and storing in the database."""
     return await document_vectorizer.process_document(
-        document_id, org_id, user_id, text, metadata, use_semantic_chunking
+        source_id, org_id, user_id, text, metadata, use_semantic_chunking
     )
 
 
 async def similarity_search(query: str,
-                          org_id: str,
+                          org_id: int,               # Integer
                           limit: int = 5,
                           threshold: float = 0.7) -> List[Dict[str, Any]]:
     """Search for chunks similar to the query."""

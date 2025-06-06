@@ -20,7 +20,7 @@ logger.info("Supabase client initialized successfully")
 supabase_admin = create_client(
     settings.SUPABASE_URL, 
     settings.SUPABASE_SERVICE_ROLE_KEY
-) if hasattr(settings, 'SUPABASE_SERVICE_ROLE_KEY') else supabase
+) if hasattr(settings, 'SUPABASE_SERVICE_ROLE_KEY') and settings.SUPABASE_SERVICE_ROLE_KEY else supabase
 logger.info("Service role client initialized successfully")
 
 # Table names for database operations (updated for new schema)
@@ -661,15 +661,6 @@ async def get_markdown_content(hyperbrowser_job_id: str, org_id: Optional[int] =
 # DOCUMENT CONVERSION FUNCTIONS
 # =============================================
 
-async def create_document_conversion_job(job_id: str, org_id: int, user_id: Optional[int] = None):
-    """Create a new document conversion job."""
-    return await create_processing_job(
-        org_id=org_id,
-        job_type="document_conversion",
-        user_id=user_id,
-        metadata={"original_job_id": job_id}
-    )
-
 async def get_document_conversion_job(job_id: str, org_id: Optional[int] = None):
     """Get a document conversion job."""
     return await get_processing_job(job_id, org_id)
@@ -682,27 +673,6 @@ async def update_document_file_count(job_id: str, total_files: int, org_id: Opti
     """Update total file count for document conversion job."""
     return await update_processing_job_total_items(job_id, total_files, org_id)
 
-async def create_document_content_record(job_id: str, filename: str, org_id: Optional[int] = None):
-    """Create a document content record."""
-    try:
-        if not org_id:
-            job = await get_document_conversion_job(job_id)
-            if job:
-                org_id = job.get("org_id")
-        
-        content_record = {
-            "org_id": org_id,
-            "job_id": job_id,
-            "filename": filename,
-            "status": "pending"
-        }
-        
-        response = supabase.table(DOCUMENT_CONTENT_TABLE).insert(content_record).execute()
-        return response.data[0] if response.data else content_record
-    except Exception as e:
-        logger.error(f"Error creating document content record: {str(e)}")
-        return None
-
 async def update_document_content(
     job_id: str, 
     filename: str, 
@@ -711,21 +681,42 @@ async def update_document_content(
     metadata=None, 
     org_id: Optional[int] = None
 ):
-    """Update document content with extracted markdown."""
+    """Insert or update document content with extracted markdown."""
     try:
-        update_data = {
-            "markdown_text": markdown_text,
-            "status": status,
-            "updated_at": dt.now().isoformat(),
-            "metadata": metadata or {}
-        }
-        
-        query = supabase.table(DOCUMENT_CONTENT_TABLE).update(update_data).eq("job_id", job_id).eq("filename", filename)
-        
+        # Check if record already exists
+        existing_query = supabase.table(DOCUMENT_CONTENT_TABLE).select("id").eq("job_id", job_id).eq("filename", filename)
         if org_id:
-            query = query.eq("org_id", org_id)
+            existing_query = existing_query.eq("org_id", org_id)
+        
+        existing_response = existing_query.execute()
+        
+        if existing_response.data and len(existing_response.data) > 0:
+            # Update existing record
+            update_data = {
+                "markdown_text": markdown_text,
+                "status": status,
+                "updated_at": dt.now().isoformat(),
+                "metadata": metadata or {}
+            }
             
-        response = query.execute()
+            query = supabase.table(DOCUMENT_CONTENT_TABLE).update(update_data).eq("job_id", job_id).eq("filename", filename)
+            
+            if org_id:
+                query = query.eq("org_id", org_id)
+                
+            response = query.execute()
+        else:
+            # Insert new record
+            insert_data = {
+                "job_id": job_id,
+                "filename": filename,
+                "markdown_text": markdown_text,
+                "status": status,
+                "metadata": metadata or {},
+                "org_id": org_id
+            }
+            
+            response = supabase.table(DOCUMENT_CONTENT_TABLE).insert(insert_data).execute()
         
         # Update job completed count
         job = await get_document_conversion_job(job_id, org_id)
@@ -837,13 +828,24 @@ async def update_document_status(document_id: str, status: str, content: dict = 
 async def update_content_source_with_chunks(content_source_id: str, chunk_ids: List[str]) -> Optional[dict]:
     """Update a content source with chunk IDs."""
     try:
+        # Get current metadata
+        existing_response = supabase.table(ORG_CONTENT_SOURCES_TABLE).select("source_metadata").eq("id", content_source_id).execute()
+        
+        existing_metadata = {}
+        if existing_response.data:
+            existing_metadata = existing_response.data[0].get("source_metadata", {})
+        
+        # Update with chunk information
+        updated_metadata = {
+            **existing_metadata,
+            "chunk_count": len(chunk_ids),
+            "chunk_ids": chunk_ids,
+            "chunks_created_at": dt.now().isoformat()
+        }
+        
         update_data = {
             "status": "completed",
-            "source_metadata": {
-                "chunk_count": len(chunk_ids),
-                "chunk_ids": chunk_ids,
-                "chunks_created_at": dt.now().isoformat()
-            },
+            "source_metadata": updated_metadata,
             "updated_at": dt.now().isoformat()
         }
         
