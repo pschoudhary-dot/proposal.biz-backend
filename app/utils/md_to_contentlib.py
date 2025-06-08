@@ -1,65 +1,168 @@
-"""Utility functions for processing markdown content and extracting structured data."""
+"""Utility functions for processing markdown content and extracting structured data with OpenRouter and Langfuse."""
 import os
-from uuid import UUID
 from typing import List, Dict, Any
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 import instructor
-from app.core.database_content_lib import get_content_sources
+from app.core.database_content_lib import get_content_sources_by_ids
 from app.core.logging import logger
 from app.schemas.content_library import BusinessInformationSchema
+from app.core.config import settings
 from langfuse import Langfuse
-from dotenv import load_dotenv
-
-load_dotenv()
+from langfuse.decorators import observe
 
 # Initialize Langfuse client
 langfuse = Langfuse(
-    secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
-    host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+    secret_key=settings.LANGFUSE_SECRET_KEY,
+    public_key=settings.LANGFUSE_PUBLIC_KEY,
+    host=settings.LANGFUSE_HOST
 )
 
-# Configure OpenAI client for OpenRouter
-client = instructor.from_openai(
-    OpenAI(
-        api_key=os.getenv("OPENROUTER_API_KEY"),
-        base_url="https://openrouter.ai/api/v1",
-    ),
-    mode=instructor.Mode.JSON  # or instructor.Mode.TOOLS for tool calling based on our needs
-)
+def estimate_token_count(content: str | int) -> int:
+    """
+    Estimate token count based on character count.
+    
+    Args:
+        content: Input text as string or length as integer
+        
+    Returns:
+        Estimated token count
+    """
+    if isinstance(content, str):
+        char_count = len(content)
+    else:  # Assume it's already a length (integer)
+        char_count = content
+        
+    return int(char_count / settings.CHARS_PER_TOKEN_ESTIMATE)
 
-DEFAULT_MODEL = "deepseek/deepseek-r1-0528:free" #google/gemini-2.0-flash-exp:free
+def select_optimal_model(content_length: int) -> Dict[str, Any]:
+    """
+    Select the optimal model based on content length and context limits.
+    
+    Args:
+        content_length: Length of content in characters (integer)
+        
+    Returns:
+        Selected model configuration
+    """
+    estimated_tokens = estimate_token_count(content_length)
+    
+    # Add buffer for system prompt, user prompt, and response
+    total_tokens_needed = estimated_tokens + 5000  # 5K buffer
+    
+    # Try models in order of preference
+    model_priority = [
+        settings.DEFAULT_CONTENT_LIB_MODEL,
+        "gemini-2.5-pro-preview",
+        "deepseek-r1"
+    ]
+    
+    for model_key in model_priority:
+        if model_key in settings.OPENROUTER_MODELS:
+            model_config = settings.OPENROUTER_MODELS[model_key]
+            if total_tokens_needed <= model_config["context_limit"]:
+                logger.info(f"Selected model {model_key} for {estimated_tokens} estimated tokens")
+                return model_config
+    
+    # If no model can handle the content, raise an error
+    raise ValueError(f"Content too large ({estimated_tokens} estimated tokens) for any available model. Maximum supported: {max(m['context_limit'] for m in settings.OPENROUTER_MODELS.values())}")
 
-async def get_system_prompt():
+async def get_system_prompt() -> str:
     """Get the system prompt from Langfuse or use a default one."""
     try:
         prompt = langfuse.get_prompt("SYS_prompt", label="production")
         return prompt.prompt
     except Exception as e:
         logger.error(f"Error getting system prompt from Langfuse: {str(e)}")
-        return """
-        You are an expert business information extractor. Your task is to analyze the provided content and extract structured business information.
-        
-        INSTRUCTIONS:
-        1. Carefully read and analyze the entire content
-        2. Extract all relevant business information
-        3. Follow the exact schema provided in the response model
-        4. If information is not available for a field, leave it as null or empty
-        5. Be thorough but only include information explicitly mentioned in the content
-        
-        IMPORTANT:
-        - Extract all services, products, team members, and other business information
-        - For each service/product, include all available details
-        - For team members, extract names, roles, and other available information
-        - Include any pricing information, case studies, or portfolio items
-        - Extract technologies, methodologies, and metrics where mentioned
-        
-        Return the information in the exact format specified by the response model.
-        """
+        return """You are a meticulous data extraction specialist. Your task is to extract ALL business information from provided documents and organize it according to the given JSON schema structure.
 
-async def extract_structured_data(content_texts: List[str], org_id: UUID) -> BusinessInformationSchema:
+CRITICAL EXTRACTION RULES:
+
+1. COMPLETENESS: Extract EVERY piece of information available. If a company has 8 services, list all 8. If they have 20 team members, list all 20. Never summarize or consolidate - capture everything.
+
+2. ACCURACY: Extract information EXACTLY as it appears in the source documents. Do not:
+   - Make assumptions or inferences
+   - Create or invent any information
+   - Fill in missing data with guesses
+   - Combine or summarize multiple items into one
+
+3. EMPTY FIELDS: If information for a required field is not found in the documents:
+   - For strings: Use empty string ""
+   - For arrays: Use empty array []
+   - For objects: Include the object with empty/default values for its properties
+
+4. EXTRACTION METHODOLOGY:
+   - Scan the entire document thoroughly before starting extraction
+   - Look for information in all possible locations (headers, footers, sidebars, etc.)
+   - Parse all listed items completely - never stop at examples or samples
+   - Check for paginated content or "View More" sections that might contain additional items
+
+5. ARRAY FIELDS: For fields that accept arrays (like Services, Portfolio, Team, etc.):
+   - Include EVERY instance found in the documents
+   - Each item should be a complete, separate entry
+   - Do not merge similar items
+   - Preserve the original order when possible
+
+6. SPECIFIC FIELD GUIDANCE:
+   - Services: Extract each service as a separate object, even if they seem related
+   - Portfolio/Projects: List every single project mentioned, no matter how briefly
+   - Case Studies: Include all success stories, testimonials, and client examples
+   - Team Members: Extract every person mentioned with a role/title
+   - Technologies: List all tools, platforms, and integrations mentioned
+   - Awards: Include all recognitions, certifications, and accolades
+   - FAQs: Extract every question-answer pair found
+
+7. TEXT EXTRACTION:
+   - Preserve the original wording and phrasing
+   - Maintain professional language and terminology
+   - Keep numerical values and percentages exactly as stated
+   - Include units of measurement (%, $, months, etc.)
+
+8. URL AND LINK EXTRACTION:
+   - Extract complete URLs including protocol (http/https)
+   - For relative links, note them as-is without constructing full URLs
+   - Include all external links, social media profiles, and resource links
+
+9. HIERARCHICAL INFORMATION:
+   - Respect parent-child relationships (e.g., service categories)
+   - Maintain groupings and classifications from the source
+   - Preserve organizational structures
+
+10. VALIDATION:
+    - Double-check that no information has been skipped
+    - Ensure all required fields are present in the output
+    - Verify that arrays contain all found items, not just samples
+
+Remember: Your role is to extract and organize information, not to interpret, summarize, or make editorial decisions. Every piece of business information in the source documents should appear in your extraction."""
+
+async def get_user_prompt() -> str:
+    """Get the user prompt from Langfuse or use a default one."""
+    try:
+        prompt = langfuse.get_prompt("Model_prompt", label="production")
+        return prompt.prompt
+    except Exception as e:
+        logger.error(f"Error getting user prompt from Langfuse: {str(e)}")
+        return """Generate a detailed JSON schema representation of the specified company using only real and verifiable information. Avoid including any fabricated or speculative content.
+
+# Steps
+
+1. Identify and gather accurate, up-to-date information about the company you are tasked to describe. This includes aspects such as the company's name, industry, headquarters, founding date, key personnel, services, products, history, and achievements.
+2. Ensure all information is factual and verifiable, pulling from reputable sources.
+3. Organize the collected information into a comprehensive JSON schema format.
+
+# Output Format
+
+The output should be formatted as a JSON object. Each key-value pair should represent a specific piece of information about the company. Ensure the JSON schema includes all the information and relevant data
+
+# Notes
+
+- Ensure all entries in the JSON are supported by cited data.
+- Do not include placeholders in the final output; ensure each element is populated with actual data.
+- Double-check the correctness of the information and ensure there are no speculative entries."""
+
+@observe(name="extract_structured_data")
+async def extract_structured_data(content_texts: List[str], org_id: int) -> BusinessInformationSchema:
     """
-    Extract structured data from markdown content using LLM.
+    Extract structured data from markdown content using OpenRouter LLM.
     
     Args:
         content_texts: List of markdown content texts
@@ -69,25 +172,42 @@ async def extract_structured_data(content_texts: List[str], org_id: UUID) -> Bus
         Structured business information
     """
     try:
-        # Get the system prompt
-        system_prompt = await get_system_prompt()
+        # Combine all content
         combined_content = "\n\n".join(content_texts)
+        content_length = len(combined_content)
         
-        # Debug log the content being sent to LLM
-        logger.debug(f"System prompt: {system_prompt[:200]}...")  # Log first 200 chars
-        logger.debug(f"Content length: {len(combined_content)} characters")
-        logger.debug(f"Sample content: {combined_content[:500]}...")  # Log first 500 chars
+        logger.info(f"Processing {len(content_texts)} documents, total length: {content_length} characters for org_id: {org_id}")
+        
+        # Select optimal model based on content length
+        try:
+            model_config = select_optimal_model(content_length)
+            model_id = model_config["id"]
+            logger.info(f"Using model: {model_id}")
+        except ValueError as e:
+            logger.error(f"Content length error: {str(e)}")
+            raise ValueError(f"Content too large for processing: {str(e)}")
+        
+        # Get prompts from Langfuse
+        system_prompt = await get_system_prompt()
+        user_prompt = await get_user_prompt()
+        
+        # Prepare the complete user message
+        full_user_prompt = f"{user_prompt}\n\nContent to process:\n\n{combined_content}"
         
         # Prepare the messages
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Extract structured business information from the following content. Be thorough and include all relevant details.\n\n{combined_content}"}
+            {"role": "user", "content": full_user_prompt}
         ]
         
-        # Use the async client to make the API call
+        # Create OpenRouter client with instructor
         async_client = AsyncOpenAI(
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-            base_url="https://openrouter.ai/api/v1"
+            api_key=settings.OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": "https://proposal.biz",
+                "X-Title": "ProposalBiz Content Library"
+            }
         )
         
         # Get the async instructor client
@@ -96,60 +216,63 @@ async def extract_structured_data(content_texts: List[str], org_id: UUID) -> Bus
         # Make the API call with timeout and retry settings
         try:
             result = await aclient.chat.completions.create(
-                model=DEFAULT_MODEL,
+                model=model_id,
                 messages=messages,
                 response_model=BusinessInformationSchema,
                 temperature=0.2,
                 max_retries=3,
-                timeout=60.0  # 60 seconds timeout
+                timeout=120.0  # 2 minutes timeout for large content
             )
             
-            # Debug log the result
-            logger.debug(f"Successfully extracted data. Result type: {type(result)}")
-            logger.debug(f"Sample extracted data: {str(result)[:500]}...")
-            
             logger.info(f"Successfully extracted structured data for org_id: {org_id}")
+            logger.debug(f"Extracted data preview: {str(result)[:500]}...")
+            
             return result
             
         except Exception as api_error:
-            logger.error(f"OpenAI API error: {str(api_error)}")
-            # Try to get more detailed error information
-            if hasattr(api_error, 'response') and api_error.response:
-                logger.error(f"API response: {api_error.response.text}")
+            logger.error(f"OpenRouter API error: {str(api_error)}")
+            # Check if it's a context length error
+            if "context" in str(api_error).lower() or "length" in str(api_error).lower():
+                raise ValueError(f"Content exceeds model context limit: {str(api_error)}")
             raise
         
     except Exception as e:
         logger.error(f"Error in extract_structured_data: {str(e)}", exc_info=True)
         raise
 
-async def process_content_sources(source_ids: List[UUID], org_id: UUID) -> Dict[str, Any]:
+@observe(name="process_content_sources")
+async def process_content_sources(source_ids: List[str], org_id: int) -> Dict[str, Any]:
     """
     Process multiple content sources and extract structured data.
     
     Args:
-        source_ids: List of content source IDs
-        org_id: Organization ID
+        source_ids: List of content source IDs (UUIDs as strings)
+        org_id: Organization ID (integer)
         
     Returns:
         Processing result
     """    
     try:
-        # Get content sources
-        sources = await get_content_sources(source_ids, org_id)
+        logger.info(f"Processing content sources: {source_ids} for org_id: {org_id}")
+        
+        # Get content sources with markdown content
+        sources = await get_content_sources_by_ids(source_ids, org_id)
         
         if not sources:
             logger.warning(f"No content sources found for org_id: {org_id}")
             return {"error": "No content sources found"}
         
-        # Collect all content texts
+        # Collect all markdown texts
         content_texts = []
         for source in sources:
-            if source.get("parsed_content"):
-                content_texts.append(source["parsed_content"])
+            markdown_content = source.get("markdown_content")
+            if markdown_content and markdown_content.strip():
+                content_texts.append(markdown_content)
+                logger.info(f"Added content from source {source['id']}: {len(markdown_content)} characters")
         
         if not content_texts:
-            logger.warning(f"No content found in sources for org_id: {org_id}")
-            return {"error": "No content found in sources"}
+            logger.warning(f"No markdown content found in sources for org_id: {org_id}")
+            return {"error": "No markdown content found in sources"}
         
         # Extract structured data
         result = await extract_structured_data(content_texts, org_id)
@@ -157,5 +280,5 @@ async def process_content_sources(source_ids: List[UUID], org_id: UUID) -> Dict[
         return {"data": result}
         
     except Exception as e:
-        logger.error(f"Error processing content sources: {str(e)}")
-        return {"error": str(e)}
+        logger.error(f"Error processing content sources: {str(e)}", exc_info=True)
+        return {"error": str(e)}    
