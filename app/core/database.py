@@ -459,15 +459,15 @@ async def update_extraction_job_color_palette(job_id: str, image_source: str, co
         logger.error(f"Error saving color palette for job_id {job_id}: {str(e)}")
 
 # =============================================
-# MARKDOWN EXTRACTION FUNCTIONS
+# MARKDOWN EXTRACTION FUNCTIONS - UPDATED
 # =============================================
 
-async def create_markdown_extraction_job(job_id: str, urls: List[str], org_id: int, user_id: Optional[int] = None):
+async def create_markdown_extraction_job(hyperbrowser_job_id: str, urls: List[str], org_id: int, user_id: Optional[int] = None):
     """
-    Create a new markdown extraction job.
+    Create a new markdown extraction job with enhanced error handling and logging.
     
     Args:
-        job_id: Hyperbrowser job ID
+        hyperbrowser_job_id: Unique identifier for this hyperbrowser job
         urls: List of URLs to extract markdown from
         org_id: Organization ID (integer)
         user_id: User ID who created the job
@@ -475,44 +475,69 @@ async def create_markdown_extraction_job(job_id: str, urls: List[str], org_id: i
     Returns:
         The created job record
     """
-    # Create processing job
-    job_record = await create_processing_job(
-        org_id=org_id,
-        job_type="markdown_extraction",
-        user_id=user_id,
-        metadata={"hyperbrowser_job_id": job_id}
-    )
-    
-    if not job_record:
-        return None
-    
-    processing_job_id = job_record["job_id"]
-    
     try:
-        # Update total items
-        await update_processing_job_total_items(processing_job_id, len(urls), org_id)
+        logger.info(f"Creating markdown extraction job for {len(urls)} URLs in org {org_id}")
         
-        # Create markdown content records for each URL
-        url_records = [{
-            "org_id": org_id,
-            "job_id": processing_job_id,
-            "url": url,
-            "status": "pending"
-        } for url in urls]
+        # Create processing job using the unified system
+        job_record = await create_processing_job(
+            org_id=org_id,
+            job_type="markdown_extraction",
+            user_id=user_id,
+            metadata={"hyperbrowser_job_id": hyperbrowser_job_id}
+        )
         
-        if url_records:
-            supabase.table(MARKDOWN_CONTENT_TABLE).insert(url_records).execute()
-            logger.info(f"Created {len(url_records)} URL records for job_id: {processing_job_id}")
+        if not job_record:
+            logger.error(f"Failed to create processing job for hyperbrowser job {hyperbrowser_job_id}")
+            return None
         
-        return job_record
+        processing_job_id = job_record["job_id"]
+        logger.info(f"Created processing job {processing_job_id} for hyperbrowser job {hyperbrowser_job_id}")
+        
+        try:
+            # Update total items count
+            await update_processing_job_total_items(processing_job_id, len(urls), org_id)
+            logger.info(f"Updated job {processing_job_id} with {len(urls)} total URLs")
+            
+            # Create markdown content records for each URL
+            url_records = [{
+                "org_id": org_id,
+                "job_id": processing_job_id,
+                "url": url,
+                "status": "pending"
+            } for url in urls]
+            
+            if url_records:
+                result = supabase.table(MARKDOWN_CONTENT_TABLE).insert(url_records).execute()
+                if result.data:
+                    logger.info(f"Created {len(url_records)} URL records for job {processing_job_id}")
+                else:
+                    logger.warning(f"Failed to create URL records for job {processing_job_id}")
+            
+            return job_record
+            
+        except Exception as e:
+            logger.error(f"Error setting up markdown content records for job {processing_job_id}: {str(e)}")
+            # Update job status to failed
+            try:
+                await update_processing_job_status(processing_job_id, "failed", error_message=str(e), org_id=org_id)
+            except Exception:
+                pass
+            return job_record
         
     except Exception as e:
-        logger.error(f"Error creating markdown extraction job: {str(e)}")
-        return job_record
+        logger.error(f"Error creating markdown extraction job: {str(e)}", exc_info=True)
+        return None
 
 async def get_markdown_extraction_job(hyperbrowser_job_id: str, org_id: Optional[int] = None):
     """
-    Get a markdown extraction job by Hyperbrowser job ID.
+    Get a markdown extraction job by Hyperbrowser job ID with enhanced logging.
+    
+    Args:
+        hyperbrowser_job_id: Hyperbrowser job ID to search for
+        org_id: Optional organization ID for security check
+        
+    Returns:
+        The job record or None if not found
     """
     try:
         query = supabase.table(PROCESSING_JOBS_TABLE).select("*").eq("job_type", "markdown_extraction")
@@ -526,20 +551,38 @@ async def get_markdown_extraction_job(hyperbrowser_job_id: str, org_id: Optional
             for job in response.data:
                 metadata = job.get("metadata", {})
                 if metadata.get("hyperbrowser_job_id") == hyperbrowser_job_id:
+                    logger.debug(f"Found markdown extraction job for hyperbrowser job {hyperbrowser_job_id}")
                     return job
+        
+        logger.warning(f"Markdown extraction job not found for hyperbrowser job {hyperbrowser_job_id}")
         return None
     except Exception as e:
         logger.error(f"Error getting markdown extraction job: {str(e)}")
         return None
 
-async def update_markdown_extraction_status(hyperbrowser_job_id: str, status: str, org_id: Optional[int] = None):
-    """Update the status of a markdown extraction job."""
+async def update_markdown_extraction_status(hyperbrowser_job_id: str, status: str, org_id: Optional[int] = None, error_message: Optional[str] = None):
+    """
+    Update the status of a markdown extraction job with enhanced logging.
+    
+    Args:
+        hyperbrowser_job_id: Hyperbrowser job ID
+        status: New status ('pending', 'processing', 'completed', 'failed')
+        org_id: Optional organization ID for security check
+        error_message: Optional error message if the job failed
+        
+    Returns:
+        The updated record or None if failed
+    """
     try:
         job = await get_markdown_extraction_job(hyperbrowser_job_id, org_id)
         if not job:
+            logger.error(f"Cannot update status - job not found for hyperbrowser job {hyperbrowser_job_id}")
             return None
-            
-        return await update_processing_job_status(job["job_id"], status, org_id=org_id)
+        
+        processing_job_id = job["job_id"]
+        logger.info(f"Updating markdown extraction job {processing_job_id} status to {status}")
+        
+        return await update_processing_job_status(processing_job_id, status, org_id=org_id, error_message=error_message)
     except Exception as e:
         logger.error(f"Error updating markdown job status: {str(e)}")
         return None
@@ -549,21 +592,41 @@ async def update_url_markdown_content(
     url: str, 
     markdown_text: str, 
     status: str = "completed", 
-    metadata=None, 
-    links=None, 
-    html=None, 
-    screenshot=None, 
+    metadata: Optional[Dict] = None, 
+    links: Optional[List[str]] = None, 
+    html: Optional[str] = None, 
+    screenshot: Optional[str] = None, 
     org_id: Optional[int] = None
 ):
-    """Update a URL record with extracted markdown content."""
+    """
+    Update a URL record with extracted markdown content - Enhanced version.
+    
+    Args:
+        hyperbrowser_job_id: Hyperbrowser job ID
+        url: URL that was processed
+        markdown_text: Extracted markdown content
+        status: Status of the extraction ('completed', 'failed', etc.)
+        metadata: Optional metadata about the extraction
+        links: Optional list of links found on the page
+        html: Optional raw HTML content
+        screenshot: Optional screenshot data
+        org_id: Optional organization ID for security check
+        
+    Returns:
+        The updated record or None if failed
+    """
     try:
         job = await get_markdown_extraction_job(hyperbrowser_job_id, org_id)
         if not job:
+            logger.error(f"Cannot update URL content - job not found for hyperbrowser job {hyperbrowser_job_id}")
             return None
             
-        job_id = job["job_id"]
+        processing_job_id = job["job_id"]
+        current_org_id = job.get("org_id")
         
-        # Update markdown content
+        logger.info(f"Updating markdown content for URL {url} in job {processing_job_id}")
+        
+        # Prepare update data
         update_data = {
             "markdown_text": markdown_text,
             "status": status,
@@ -577,59 +640,104 @@ async def update_url_markdown_content(
         if metadata:
             update_data["metadata"] = metadata
         
-        query = supabase.table(MARKDOWN_CONTENT_TABLE).update(update_data).eq("job_id", job_id).eq("url", url)
+        # Update markdown content record
+        query = supabase.table(MARKDOWN_CONTENT_TABLE).update(update_data).eq("job_id", processing_job_id).eq("url", url)
         
         if org_id:
             query = query.eq("org_id", org_id)
+        elif current_org_id:
+            query = query.eq("org_id", current_org_id)
             
         response = query.execute()
         
+        if not response.data:
+            logger.warning(f"No markdown content record found for URL {url} in job {processing_job_id}")
+        else:
+            logger.debug(f"Updated markdown content record for URL {url}")
+        
         # Save links if provided
         if links and isinstance(links, list):
-            link_records = [{
-                "org_id": org_id,
-                "job_id": job_id,
-                "url": url,
-                "link": link
-            } for link in links if link]
+            try:
+                # Clean up existing links for this URL and job
+                delete_query = supabase.table(EXTRACTED_LINKS_TABLE).delete().eq("job_id", processing_job_id).eq("url", url)
+                if org_id:
+                    delete_query = delete_query.eq("org_id", org_id)
+                elif current_org_id:
+                    delete_query = delete_query.eq("org_id", current_org_id)
+                delete_query.execute()
+                
+                # Insert new links
+                link_records = [{
+                    "org_id": org_id or current_org_id,
+                    "job_id": processing_job_id,
+                    "url": url,
+                    "link": link
+                } for link in links if link and isinstance(link, str)]
+                
+                if link_records:
+                    supabase.table(EXTRACTED_LINKS_TABLE).insert(link_records).execute()
+                    logger.debug(f"Saved {len(link_records)} links for URL {url}")
+                    
+            except Exception as e:
+                logger.error(f"Error saving links for URL {url}: {str(e)}")
+        
+        # Update job progress
+        try:
+            completed_items = job.get("completed_items", 0) + (1 if status == "completed" else 0)
+            total_items = job.get("total_items", 1)
             
-            if link_records:
-                supabase.table(EXTRACTED_LINKS_TABLE).insert(link_records).execute()
-        
-        # Update job completed count
-        completed_items = job.get("completed_items", 0) + 1
-        total_items = job.get("total_items", 1)
-        
-        if completed_items >= total_items:
-            await update_processing_job_status(job_id, "completed", completed_items, org_id=org_id)
-        else:
-            await update_processing_job_status(job_id, "processing", completed_items, org_id=org_id)
+            if completed_items >= total_items:
+                await update_processing_job_status(processing_job_id, "completed", completed_items, org_id=current_org_id)
+                logger.info(f"Job {processing_job_id} completed: {completed_items}/{total_items} URLs processed")
+            else:
+                await update_processing_job_status(processing_job_id, "processing", completed_items, org_id=current_org_id)
+                logger.debug(f"Job {processing_job_id} progress: {completed_items}/{total_items} URLs processed")
+                
+        except Exception as e:
+            logger.error(f"Error updating job progress for {processing_job_id}: {str(e)}")
         
         return response.data[0] if response.data else None
         
     except Exception as e:
-        logger.error(f"Error updating markdown content: {str(e)}")
+        logger.error(f"Error updating markdown content for URL {url}: {str(e)}", exc_info=True)
         return None
 
 async def get_markdown_content(hyperbrowser_job_id: str, org_id: Optional[int] = None):
-    """Get all markdown content for a job."""
+    """
+    Get all markdown content for a job with enhanced error handling.
+    
+    Args:
+        hyperbrowser_job_id: Hyperbrowser job ID
+        org_id: Optional organization ID for security check
+        
+    Returns:
+        Dictionary with job and content data, or None if not found
+    """
     try:
         job = await get_markdown_extraction_job(hyperbrowser_job_id, org_id)
         if not job:
+            logger.warning(f"Job not found for hyperbrowser job {hyperbrowser_job_id}")
             return None
         
-        job_id = job["job_id"]
+        processing_job_id = job["job_id"]
+        current_org_id = job.get("org_id")
+        
+        logger.info(f"Getting markdown content for job {processing_job_id}")
         
         # Get content
-        content_query = supabase.table(MARKDOWN_CONTENT_TABLE).select("*").eq("job_id", job_id)
+        content_query = supabase.table(MARKDOWN_CONTENT_TABLE).select("*").eq("job_id", processing_job_id)
         if org_id:
             content_query = content_query.eq("org_id", org_id)
+        elif current_org_id:
+            content_query = content_query.eq("org_id", current_org_id)
         content_response = content_query.execute()
         
         # Get links
-        links_query = supabase.table(EXTRACTED_LINKS_TABLE).select("*").eq("job_id", job_id)
+        links_query = supabase.table(EXTRACTED_LINKS_TABLE).select("*").eq("job_id", processing_job_id)
         if org_id:
             links_query = links_query.eq("org_id", org_id)
+        elif current_org_id:
+            links_query = links_query.eq("org_id", current_org_id)
         links_response = links_query.execute()
         
         # Organize links by URL
@@ -648,13 +756,17 @@ async def get_markdown_content(hyperbrowser_job_id: str, org_id: Optional[int] =
             url = content.get("url")
             if url and url in url_links:
                 content["links"] = url_links[url]
+            else:
+                content["links"] = []
+        
+        logger.info(f"Retrieved {len(content_data)} content records for job {processing_job_id}")
         
         return {
             "job": job,
             "content": content_data
         }
     except Exception as e:
-        logger.error(f"Error getting markdown content: {str(e)}")
+        logger.error(f"Error getting markdown content: {str(e)}", exc_info=True)
         return None
 
 # =============================================

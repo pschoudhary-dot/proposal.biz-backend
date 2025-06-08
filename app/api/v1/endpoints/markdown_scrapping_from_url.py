@@ -1,16 +1,14 @@
 """
-API endpoints for markdown extraction using Hyperbrowser.
+API endpoints for markdown extraction using Hyperbrowser - Improved with on-demand processing.
 """
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Path, Depends
 import uuid
-from uuid import UUID
 from app.core.logging import logger
 from app.core.database import (
     create_markdown_extraction_job,
-    get_markdown_extraction_job,
     get_markdown_content,
-    update_markdown_extraction_status,
-    get_default_org_id
+    get_user_organizations,
+    get_processing_job
 )
 from app.schemas.markdown_extraction import (
     MarkdownExtractionRequest,
@@ -19,169 +17,269 @@ from app.schemas.markdown_extraction import (
     MarkdownResultResponse,
     MarkdownContent
 )
-from app.utils.markdown_extraction import start_batch_scrape
+from app.utils.markdown_extraction import start_batch_scrape, check_and_process_batch_job
 from app.api.deps import get_current_user_id
 
 router = APIRouter()
+
 
 @router.post("/getmd", response_model=MarkdownExtractionResponse, status_code=202)
 async def extract_markdown(
     request: MarkdownExtractionRequest,
     background_tasks: BackgroundTasks,
-    user_id: str = Depends(get_current_user_id)
+    user_id: int = Depends(get_current_user_id)
 ):
     """
-    Extract markdown content from a list of URLs.
+    Extract markdown content from a list of URLs using Hyperbrowser batch scraping.
     
-    This endpoint initiates an asynchronous batch scraping process using Hyperbrowser.
-    It returns a job ID that can be used to check the status and retrieve results.
+    This endpoint initiates an asynchronous batch scraping process that can handle
+    up to 1,000 URLs at once. It returns a job ID for tracking progress.
+    
+    The job is submitted to Hyperbrowser and status is checked on-demand when
+    users call the status or results endpoints.
+    
+    Args:
+        request: MarkdownExtractionRequest containing URLs and optional org_id
+        background_tasks: FastAPI background tasks for async job submission
+        user_id: Current user ID from authentication
+        
+    Returns:
+        MarkdownExtractionResponse with job details
     """
     urls = request.urls
+    org_id = request.org_id
     
     if not urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
     
-    logger.info(f"Received markdown extraction request for {len(urls)} URLs")
+    if len(urls) > 1000:
+        raise HTTPException(status_code=400, detail="Maximum 1000 URLs allowed per batch")
     
-    # Get organization ID (use provided or default)
-    org_id = request.org_id
-    if not org_id:
-        org_id = await get_default_org_id(user_id)
-        if not org_id:
-            raise HTTPException(status_code=400, detail="No organization ID provided and no default organization found")
-    
-    # Generate a job ID
-    job_id = str(uuid.uuid4())
+    logger.info(f"Received markdown extraction request for {len(urls)} URLs from user {user_id}")
     
     try:
-        # Create job in database with organization ID
-        job_record = await create_markdown_extraction_job(job_id, urls, str(org_id), user_id)
+        # Get organization ID if not provided
+        if not org_id:
+            user_orgs = await get_user_organizations(user_id)
+            if not user_orgs:
+                raise HTTPException(status_code=400, detail="User is not a member of any organization")
+            org_id = user_orgs[0]["org_id"]
+            logger.info(f"Using default organization ID {org_id} for user {user_id}")
+        else:
+            # Validate user has access to the organization
+            user_orgs = await get_user_organizations(user_id)
+            user_org_ids = [org["org_id"] for org in user_orgs]
+            if org_id not in user_org_ids:
+                raise HTTPException(status_code=403, detail="User does not have access to this organization")
+            logger.info(f"Using provided organization ID {org_id} for user {user_id}")
+        
+        # Generate a job ID for this batch
+        hyperbrowser_job_id = str(uuid.uuid4())
+        
+        # Create job in database
+        job_record = await create_markdown_extraction_job(
+            hyperbrowser_job_id=hyperbrowser_job_id, 
+            urls=urls, 
+            org_id=org_id, 
+            user_id=user_id
+        )
         
         if not job_record:
+            logger.error(f"Failed to create markdown extraction job for user {user_id}")
             raise HTTPException(status_code=500, detail="Failed to create extraction job")
         
-        # Start batch scraping in the background
-        background_tasks.add_task(start_batch_scrape, job_id, urls, str(org_id))
+        processing_job_id = job_record["job_id"]
+        logger.info(f"Created markdown extraction job {processing_job_id} with hyperbrowser job {hyperbrowser_job_id}")
+        
+        # Submit batch scraping job (no polling, just submit)
+        background_tasks.add_task(start_batch_scrape, hyperbrowser_job_id, urls, org_id)
+        logger.info(f"Submitted batch scraping job {hyperbrowser_job_id} to background task")
         
         return MarkdownExtractionResponse(
-            job_id=job_id,
+            job_id=processing_job_id,
             org_id=org_id,
             status="pending",
-            message="Markdown extraction job started successfully",
+            message="Markdown extraction job submitted successfully",
             total_urls=len(urls)
         )
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Error starting markdown extraction: {str(e)}")
+        logger.error(f"Error starting markdown extraction for user {user_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error starting extraction: {str(e)}")
 
 
 @router.get("/getmd/{job_id}/status", response_model=MarkdownStatusResponse)
 async def get_markdown_status(
     job_id: str = Path(..., description="Extraction job ID"),
-    user_id: str = Depends(get_current_user_id)
+    user_id: int = Depends(get_current_user_id)
 ):
     """
     Check the status of a markdown extraction job.
     
-    This endpoint returns the current status of the job, including how many URLs
-    have been processed out of the total.
+    This endpoint checks the Hyperbrowser status on-demand and returns the current
+    status of the job, including how many URLs have been processed.
+    
+    Args:
+        job_id: The processing job ID (not hyperbrowser job ID)
+        user_id: Current user ID from authentication
+        
+    Returns:
+        MarkdownStatusResponse with current job status
     """
-    logger.info(f"Checking status for markdown job: {job_id}")
+    logger.info(f"Checking status for markdown job {job_id} by user {user_id}")
     
     try:
-        # Get job from database
-        job = await get_markdown_extraction_job(job_id)
+        # Get user organizations for security check
+        user_orgs = await get_user_organizations(user_id)
+        if not user_orgs:
+            raise HTTPException(status_code=400, detail="User is not a member of any organization")
+        
+        user_org_ids = [org["org_id"] for org in user_orgs]
+        
+        # Try to get job for each organization the user belongs to
+        job = None
+        org_id = None
+        for org_id_candidate in user_org_ids:
+            job = await get_processing_job(job_id, org_id_candidate)
+            if job:
+                org_id = org_id_candidate
+                break
         
         if not job:
-            # For debugging, log what we got back
-            logger.error(f"Job not found in database: {job_id}")
-            # Return a default response instead of 404 for easier debugging
-            return MarkdownStatusResponse(
-                job_id=job_id,
-                status="not_found",
-                total_urls=0,
-                completed_urls=0,
-                message=f"Job {job_id} not found in database"
-            )
+            logger.warning(f"Job {job_id} not found for user {user_id}")
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
         
-        # Get organization ID from the job record
-        org_id = job.get("org_id")
-        if not org_id:
-            raise HTTPException(status_code=500, detail="Job record missing organization ID")
+        if org_id not in user_org_ids:
+            logger.warning(f"User {user_id} attempted to access job {job_id} from unauthorized org {org_id}")
+            raise HTTPException(status_code=403, detail="Access denied to this job")
         
-        logger.info(f"Found job in database: {job_id} with status {job.get('status', 'unknown')}")
+        # Get the hyperbrowser job ID from metadata
+        hyperbrowser_job_id = job.get("metadata", {}).get("hyperbrowser_job_id")
+        if not hyperbrowser_job_id:
+            logger.error(f"Job {job_id} missing hyperbrowser_job_id in metadata")
+            raise HTTPException(status_code=500, detail="Job missing hyperbrowser job ID")
+        
+        # Check status with Hyperbrowser on-demand
+        status_info = await check_and_process_batch_job(hyperbrowser_job_id, org_id)
+        
+        # Refresh job data after potential processing
+        job = await get_processing_job(job_id, org_id)
+        current_status = job.get("status", "unknown")
+        
+        # Handle different status scenarios
+        if status_info.get("status") == "error":
+            error_msg = status_info.get("error", "Unknown error")
+            logger.error(f"Error checking job {job_id}: {error_msg}")
+            raise HTTPException(status_code=500, detail=f"Error checking job status: {error_msg}")
+        
+        logger.info(f"Found job {job_id} with status {current_status} in org {org_id}")
         
         return MarkdownStatusResponse(
             job_id=job_id,
-            org_id=UUID(org_id),
-            status=job.get("status", "unknown"),
-            total_urls=job.get("total_urls", 0),
-            completed_urls=job.get("completed_urls", 0),
-            message=f"Job status: {job.get('status', 'unknown')}"
+            org_id=org_id,
+            status=current_status,
+            total_urls=job.get("total_items", 0),
+            completed_urls=job.get("completed_items", 0),
+            message=f"Job status: {current_status}"
         )
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Error checking markdown job status: {str(e)}")
-        # Return a response with error details instead of throwing an exception
-        return MarkdownStatusResponse(
-            job_id=job_id,
-            status="error",
-            total_urls=0,
-            completed_urls=0,
-            message=f"Error checking job status: {str(e)}"
-        )
+        logger.error(f"Error checking markdown job status for job {job_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error checking job status: {str(e)}")
 
 
 @router.get("/getmd/{job_id}", response_model=MarkdownResultResponse)
 async def get_markdown_results(
     job_id: str = Path(..., description="Extraction job ID"),
-    user_id: str = Depends(get_current_user_id)
+    user_id: int = Depends(get_current_user_id)
 ):
     """
     Get the results of a markdown extraction job.
     
-    This endpoint returns the markdown content extracted from each URL,
-    along with any links found on the pages.
+    This endpoint checks the Hyperbrowser status on-demand, processes results if
+    completed, and returns the markdown content extracted from each URL.
+    
+    Args:
+        job_id: The processing job ID (not hyperbrowser job ID)
+        user_id: Current user ID from authentication
+        
+    Returns:
+        MarkdownResultResponse with extraction results
     """
-    logger.info(f"Getting results for markdown job: {job_id}")
+    logger.info(f"Getting results for markdown job {job_id} by user {user_id}")
     
     try:
-        # Get job data from database
-        data = await get_markdown_content(job_id)
+        # Get user organizations for security check
+        user_orgs = await get_user_organizations(user_id)
+        if not user_orgs:
+            raise HTTPException(status_code=400, detail="User is not a member of any organization")
         
-        if not data:
-            logger.error(f"Results not found for job: {job_id}")
-            # Return a response with error details instead of 404
+        user_org_ids = [org["org_id"] for org in user_orgs]
+        
+        # Try to get job for each organization the user belongs to
+        job = None
+        org_id = None
+        for org_id_candidate in user_org_ids:
+            job = await get_processing_job(job_id, org_id_candidate)
+            if job:
+                org_id = org_id_candidate
+                break
+        
+        if not job:
+            logger.warning(f"Job {job_id} not found for user {user_id}")
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        
+        # Get the hyperbrowser job ID from metadata
+        hyperbrowser_job_id = job.get("metadata", {}).get("hyperbrowser_job_id")
+        if not hyperbrowser_job_id:
+            logger.error(f"Job {job_id} missing hyperbrowser_job_id in metadata")
+            raise HTTPException(status_code=500, detail="Job missing hyperbrowser job ID")
+        
+        # Check status and process results if needed (on-demand)
+        status_info = await check_and_process_batch_job(hyperbrowser_job_id, org_id)
+        
+        # Handle different status scenarios
+        if status_info.get("status") == "error":
+            error_msg = status_info.get("error", "Unknown error")
+            logger.error(f"Error processing job {job_id}: {error_msg}")
+            raise HTTPException(status_code=500, detail=f"Error processing job: {error_msg}")
+        
+        if status_info.get("status") == "processing":
+            # Job still processing, return current status without results
+            job = await get_processing_job(job_id, org_id)  # Refresh job data
             return MarkdownResultResponse(
                 job_id=job_id,
-                status="not_found",
-                total_urls=0,
-                completed_urls=0,
-                error=f"Job {job_id} not found or has no results"
+                org_id=org_id,
+                status="processing",
+                total_urls=job.get("total_items", 0),
+                completed_urls=job.get("completed_items", 0),
+                results=[],
+                error=None
             )
         
-        job = data.get("job", {})
-        content_data = data.get("content", [])
+        # Get job data from database using hyperbrowser job ID
+        data = await get_markdown_content(hyperbrowser_job_id, org_id)
         
-        # Get organization ID from the job record
-        org_id = job.get("org_id")
-        if not org_id:
-            raise HTTPException(status_code=500, detail="Job record missing organization ID")
+        if not data:
+            logger.warning(f"Results not found for hyperbrowser job {hyperbrowser_job_id}")
+            raise HTTPException(status_code=404, detail=f"Results not found for job {job_id}")
+        
+        # Refresh job data after potential processing
+        job = await get_processing_job(job_id, org_id)
+        content_data = data.get("content", [])
         
         # Process status based on job status
         status = job.get("status", "unknown")
-        logger.info(f"Found job {job_id} with status {status} and {len(content_data)} content items")
+        total_urls = job.get("total_items", 0)
+        completed_urls = job.get("completed_items", 0)
         
-        if status != "completed" and status != "failed":
-            return MarkdownResultResponse(
-                job_id=job_id,
-                org_id=UUID(org_id),
-                status=status,
-                total_urls=job.get("total_urls", 0),
-                completed_urls=job.get("completed_urls", 0),
-                error=f"Job is still {status}. Try again later."
-            )
+        logger.info(f"Found job {job_id} with status {status}, {completed_urls}/{total_urls} URLs completed, {len(content_data)} content items")
         
         # Convert content data to Pydantic models
         results = []
@@ -190,28 +288,25 @@ async def get_markdown_results(
                 url=content.get("url", ""),
                 status=content.get("status", "unknown"),
                 markdown_text=content.get("markdown_text"),
-                error=content.get("error"),
+                error=content.get("metadata", {}).get("error") if content.get("status") == "failed" else None,
                 metadata=content.get("metadata"),
                 links=content.get("links", []),
-                org_id=UUID(org_id)
+                org_id=org_id
             ))
         
         return MarkdownResultResponse(
             job_id=job_id,
-            org_id=UUID(org_id),
+            org_id=org_id,
             status=status,
-            total_urls=job.get("total_urls", 0),
-            completed_urls=job.get("completed_urls", 0),
-            results=results
+            total_urls=total_urls,
+            completed_urls=completed_urls,
+            results=results,
+            error=job.get("error_message") if status == "failed" else None
         )
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Error retrieving markdown results: {str(e)}")
-        # Return a response with error details instead of throwing an exception
-        return MarkdownResultResponse(
-            job_id=job_id,
-            status="error",
-            total_urls=0,
-            completed_urls=0,
-            error=f"Error retrieving results: {str(e)}"
-        )
+        logger.error(f"Error retrieving markdown results for job {job_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error retrieving results: {str(e)}")

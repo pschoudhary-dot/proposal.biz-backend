@@ -20,7 +20,8 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = Field(..., env="SUPABASE_URL")
     SUPABASE_KEY: str = Field(..., env="SUPABASE_KEY")
     SUPABASE_SERVICE_ROLE_KEY: Optional[str] = Field(None, env="SUPABASE_SERVICE_ROLE_KEY")
-    
+    OPENROUTER_API_KEY: str = Field(..., env="OPENROUTER_API_KEY")
+
     # Storage Configuration
     STORAGE_BUCKET_NAME: str = Field("websiteassets", env="STORAGE_BUCKET_NAME")
 
